@@ -1,0 +1,56 @@
+version: '3.9'
+
+services:
+  litellm-hub:
+    image: litellmproxy/litellm-proxy:v1.65.0
+    container_name: litellm-hub
+    user: "${UID:-1000}:${GID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-}
+      - DATABASE_URL=postgresql://litellm:${DB_PASSWORD:-}@postgres/litellm
+      - LOG_LEVEL=ERROR
+      - LITELLM_CONFIG=/app/config/config.yaml
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro
+    networks:
+      - llm-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: litellm-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_DB=litellm
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - llm-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  llm-net:
+    driver: bridge
+    name: spark-kit_llm-net
+
+volumes:
+  postgres_data:
+    driver: local

@@ -1,0 +1,76 @@
+# Git Ignore: Spark Kit Multi-Node DGX LLM Stack
+
+# Git internal
+.git/
+.git-blame-ignore-revs
+.gitattributes
+
+# Environment files (contain secrets, API keys, database passwords)
+.env
+.env.*
+!env.example
+
+# Docker compose lockfiles (may change frequently)
+docker-compose.lock
+compose.yaml.lock
+
+# Python cache (if litellm uses Python)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.tox/
+.nox/
+
+# Node.js (if any TypeScript dependencies)
+node_modules/
+
+# Virtual environments (Python)
+venv/
+.venv/
+
+# HuggingFace cache files (large model weights, not needed in git)
+.cache/
+huggingface/cache/
+
+# OS-specific artifacts
+.DS_Store          # macOS
+Thumbs.db           # Windows
+ehthumbs.db         # Windows EXIF thumbnails
+Desktop.ini          # Windows folder settings
+
+# Build artifacts and temp files
+*.log
+*.tmp
+*.swp
+*~
+
+# Container runtime specific (Docker/Podman)
+container/
+containers-*/
+
+# IDE/editor specific
+.idea/
+.vscode/settings.json
+.vscode/tasks.json  # but keep .vscode/extensions.json if it's configuration-only
+
+# Database dumps (sensitive data)
+*.db
+*.sqlite
+
+# Generated config from deployment (may need to be recreated with new keys)
+hub/.env
+worker/vllm.env
+
+# Model cache directory (should not be tracked)
+/mnt/shared-models/
+.huggingface/
+model_cache/
+
+# Backup files
+*.bak
+*.backup
+*.old

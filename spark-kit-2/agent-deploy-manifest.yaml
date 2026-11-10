@@ -1,0 +1,126 @@
+# Agent Deployment Manifest: DGX Spark LLM Stack
+# Version: 1.0
+# Purpose: Enables agents to automatically discover and deploy stack across multiple DGX Spark nodes
+
+# Topology Discovery Strategy
+topology:
+  mode: auto-discover  # or 'explicit-list'
+  
+  # Auto-discovery rules (agent scans network for running services)
+  discovery_rules:
+    - probe_port: 4000     # Hub LiteLLM health endpoint
+      is_hub: true         # Node with running litellm = Hub
+      
+    - probe_gpu: nvidia    # Worker nodes must have GPU
+      max_gpu_count: 1     # one unified GB10 GPU per DGX Spark (128 GB unified memory)
+
+# Deployment Configuration
+deployment:
+  hub:
+    role: litellm_hub
+    port: 4000
+    services:
+      - litellm-hub
+      - postgres
+    
+  worker:
+    role: vllm_worker
+    network_mode: host    # Per security.md recommendation
+    gpu_utilization: 0.4  # default; env-overridable via GPU_MEM_UTIL
+
+# Agent Interface Specifications
+agent_protocol:
+  version: "1.0"
+  
+  # Agent commands supported
+  commands:
+    - deploy_hubs:     # Deploy LiteLLM hubs to all eligible nodes
+        inputs: []
+        outputs: [hub_inventory]
+    
+    - deploy_workers:  # Deploy vLLM workers with model selection
+        inputs: [model_name]
+        outputs: [worker_inventory]
+    
+    - register_hub:    # Register node as Hub (for explicit mode)
+        inputs: [lan_ip, port=4000]
+        outputs: [registration_status]
+    
+    - discover_topology:  # Scan network and return node inventory
+        inputs: [discovery_radius="10.0.0.0/24"]
+        outputs: [inventory]
+    
+    - verify_healthy:  # Check all deployed nodes for health
+        inputs: []
+        outputs: [health_report]
+
+# Node Identification Strategy
+node_identification:
+  status: unimplemented   # no code currently reads these markers or env vars; planned, not active
+  hub_markers:
+    - file: infrastructure/hub/.hub-node
+    - env_var: NODE_ROLE=hub
+    
+  worker_markers:   # also unimplemented (see status above)
+    - file: infrastructure/worker/.worker-node  
+    - env_var: NODE_ROLE=worker
+
+# Bootstrap Deployment
+bootstrap:
+  phase_1_hub_setup: |
+    # Agent executes on each eligible node to determine if it should be Hub or Worker
+    - Run discovery probe on port 4000 (LiteLLM health endpoint)
+    - If responding with {"status":"ok"} => Mark as existing Hub
+    - Else: Check for LiteLLM deployment artifacts in infrastructure/hub/
+    - If hub artifacts present + user request to deploy => Deploy as Hub
+    
+  phase_2_worker_setup: |
+    # Agent executes on each GPU-enabled node that's not a Hub
+    - Verify GPU availability and driver compatibility
+    - Pull vLLM container image if needed (cache via NFS or direct download)
+    - Start vLLM worker with --network host for simplicity
+    
+  phase_3_verification: |
+    - Poll all deployment targets for health check endpoints
+    - Generate deployment report: [hub_endpoints, worker_endpoints]
+    
+# Agent Deployment Checklist (for agent implementation)
+agent_checklist:
+  pre_deployment:
+    - Verify Docker runtime available on target node
+    - Check NVIDIA GPU drivers and CUDA compatibility  
+    - Confirm network connectivity within LAN VLAN
+    - Validate /mnt/shared-models NFS mount or accept independent model download
+    
+  during_deployment:
+    - Execute ./deploy.sh (non-sudo mode)
+    - Monitor container startup via docker compose ps
+    - Verify health endpoints respond
+  
+  post_deployment:
+    - Register deployed nodes in hub inventory
+    - Record deployment timestamps for audit trail
+    - Generate node topology map
+
+# Agent-to-Agent Communication Protocol
+# REMOVED: the http://localhost:8001/deploy/health endpoint has no backing service.
+# See AGENT.md "Future work (not implemented)".
+
+# Topology Map Example (after deployment)
+example_topology_map: |
+  [
+    {"node_id": "spark-01", "ip": "10.0.0.30", "role": "hub", "litellm_endpoint": "http://10.0.0.30:4000/v1"},
+    {"node_id": "spark-02", "ip": "10.0.0.31", "role": "worker", "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4"},
+    {"node_id": "spark-03", "ip": "10.0.0.32", "role": "worker", "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4"},
+    {"node_id": "spark-04", "ip": "10.0.0.33", "role": "worker", "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4"},
+    {"node_id": "spark-05", "ip": "10.0.0.34", "role": "worker", "vllm_model": "nvidia/Qwen3.6-35B-A3B-NVFP4"}
+  ]
+
+# Version and metadata
+metadata:
+  manifest_version: "1.0"
+  created_by: "spark-kit-team"
+  compatible_with:
+    - nvidia-dgx-spark-128gb-unified
+    - ubuntu-22.04-lts
+    - docker-ce-24.x

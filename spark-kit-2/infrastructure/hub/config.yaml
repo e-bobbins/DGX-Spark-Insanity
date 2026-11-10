@@ -1,0 +1,18 @@
+model_list:
+  - model_name: qwen3.6-35b
+    litellm_params:
+      model: openai/nvidia/Qwen3.6-35B-A3B-NVFP4
+      # Worker vLLM endpoint (workers bind 0.0.0.0:8000 with --network host).
+      # Same host as the hub: host.docker.internal (see extra_hosts in docker-compose.yml).
+      # Multi-node: set to the worker node's LAN IP, e.g. http://10.0.0.31:8000/v1
+      api_base: http://host.docker.internal:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      reasoning_effort: medium
+      litellm_settings:
+        model_api_name: openai-completion
+        tool_choice: auto
+      max_tokens: 8192
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  disable_env_credential_login: true
