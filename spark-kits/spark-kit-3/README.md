@@ -388,9 +388,9 @@ The default model is `nvidia/Qwen3.6-35B-A3B-NVFP4` as specified in the spec.
 
 ---
 
-## Supported User Stories
+## Supported Use Cases
 
-| User Story | Status |
+| Scenario | Status |
 |------------|--------|
 | Single deploy entry point per node | ✅ `./infrastructure/deploy.sh` |
 | Ask if node hosts LiteLLM | ✅ Role prompt |
