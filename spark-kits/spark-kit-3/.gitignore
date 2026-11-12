@@ -1,0 +1,66 @@
+# DGX Spark LLM Stack - Git Ignore
+# Spark Kit 3: Consolidated Inference Kit
+
+# Generated directory - contains beans and config generated from inventory
+generated/
+
+# Secrets directory - contains API keys, database passwords, etc.
+secrets/
+
+# Environment files (may contain secrets)
+*.env
+!*.env.example
+!recipes/*.yaml
+
+# besetzt files
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Docker compose lock files
+docker-compose.*.lock
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+
+# IDE/Editor files
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# OS-specific artifacts
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Hughggingface cache (should not be tracked)
+.cache/
+.huggingface/
+huggingface/
+
+# Model files (large, should not be tracked)
+*.bin
+*.safetensors
+*.model
+
+# NFS export directory (should not be tracked)
+/mnt/shared-models/
+
+# Built artifacts
+build/
+dist/
+
+# Docker artifacts (local)
+.docker/
+
+# Shell history (if any)
+.bash_history
+.history

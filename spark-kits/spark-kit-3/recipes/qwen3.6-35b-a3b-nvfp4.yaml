@@ -1,0 +1,46 @@
+# Recipe: nvidia/Qwen3.6-35B-A3B-NVFP4
+# Default model for DGX Spark LLM Stack
+# Optimized for agentic workloads on 128GB unified memory (Grace-Blackwell GB10)
+
+# HuggingFace model identifier
+# This is the actual model checkpoint that will be loaded
+model_name: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+
+# Model name as exposed through LiteLLM
+# Clients will use this name to access the model
+served_model_name: "qwen3.6-35b-a3b-nvfp4"
+
+# Tool call parser for vLLM
+# Confirmed real parser in current vLLM: qwen3_xml
+tool_call_parser: "qwen3_xml"
+
+# Reasoning parser for vLLM
+# Confirmed real parser in current vLLM: qwen3
+reasoning_parser: "qwen3"
+
+# Maximum model length (context window)
+# 262144 = 256K tokens
+max_model_len: 262144
+
+# GPU memory utilization
+# 0.8 = 80% of 128GB = ~102GB allocated to vLLM
+# This provides optimal performance for agentic workloads while maintaining system stability
+gpu_memory_utilization: 0.8
+
+# Maximum number of concurrent sequences
+# Increased from default 6 to 15 for better throughput with agentic workloads
+max_num_seqs: 15
+
+# Enable automatic tool choice
+# Allows vLLM to automatically select appropriate tools
+enable_auto_tool_choice: true
+
+# Trust remote code
+# Required for some model functionalities
+trust_remote_code: true
+
+# Additional vLLM flags (optional)
+# These will be passed directly to the vLLM command line
+# Example:
+#   --dump-config: false
+#   --log-level: INFO

@@ -1,0 +1,69 @@
+# Docker Compose configuration for LiteLLM Hub
+# Runs as non-root service user with health checks and restart policies
+
+version: '3.9'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: litellm-postgres
+    restart: unless-stopped
+    user: "${SVC_UID:-1000}:${SVC_GID:-1000}"
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: litellm
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - llm-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # No ports published - only accessible via bridge network
+
+  litellm:
+    image: ghcr.io/berriai/litellm:1.65.0
+    container_name: litellm-proxy
+    restart: unless-stopped
+    user: "${SVC_UID:-1000}:${SVC_GID:-1000}"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      DATABASE_URL: ${DATABASE_URL}
+      LOG_LEVEL: ERROR
+      STORE_MODEL_IN_DB: "True"
+    env_file:
+      - ${GENERATED_DIR:-../generated}/hub.env
+    volumes:
+      - ${GENERATED_DIR:-../generated}/litellm-config.yaml:/app/config.yaml:ro
+      - ${GENERATED_DIR:-../generated}:/app/generated:ro
+    ports:
+      - "${NODE_IP:-0.0.0.0}:4000:4000"
+    networks:
+      llm-net:
+        aliases:
+          - litellm-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  llm-net:
+    driver: bridge
+    name: spark-kit-llm-net
