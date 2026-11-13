@@ -62,19 +62,49 @@ SYNC_KEYS_ONLY=false
 # --- Functions ---
 
 log() {
-    echo "[+] $1"
+    echo "[$(date '+%H:%M:%S')] [+] $1"
 }
 
 log_error() {
-    echo "[!] ERROR: $1" >&2
+    echo "[$(date '+%H:%M:%S')] [!] ERROR: $1" >&2
 }
 
 log_warn() {
-    echo "[!] WARNING: $1" >&2
+    echo "[$(date '+%H:%M:%S')] [!] WARNING: $1" >&2
 }
 
 log_info() {
-    echo "[i] $1"
+    echo "[$(date '+%H:%M:%S')] [i] $1"
+}
+
+# Progress tracker: call step "Doing X" before each major phase.
+STEP_NUM=0
+STEP_TOTAL=9
+step() {
+    STEP_NUM=$((STEP_NUM + 1))
+    printf '\n[%d/%d] %s...\n' "${STEP_NUM}" "${STEP_TOTAL}" "$1"
+}
+
+# Wait for a container to report healthy, with visible progress.
+# $1 container name, $2 label. Bounded: after the timeout the script moves
+# on and tells the user how to check (model downloads can outwait any wait).
+wait_healthy() {
+    local container="$1" label="$2"
+    local tries=36 interval=10  # ~6 minutes
+    local i
+    for ((i = 1; i <= tries; i++)); do
+        if docker inspect "${container}" --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy; then
+            printf '\r[%d/%d] %s: healthy ✓\n' "${i}" "${tries}" "${label}"
+            return 0
+        fi
+        printf '\r[%d/%d] waiting for %s (pull/download can take a while; Ctrl-C safe, deployment continues in background)...' "${i}" "${tries}" "${label}"
+        sleep "${interval}"
+    done
+    printf '\n'
+    log_warn "${label} not healthy after ~6 min. It is still running in the background;"
+    log_warn "follow progress with: docker logs -f ${container}"
+    log_warn "then verify with: ./scripts/verify.sh"
+    return 0
 }
 
 # Validate mode and sudo
@@ -611,6 +641,16 @@ generate_secrets() {
     log "Generating secrets..."
     touch_secrets_dir
 
+    # Worker secret first: a hub+worker node's hub.env embeds this key.
+    if is_worker; then
+        local VLLM_API_KEY_FILE="${SECRETS_DIR}/vllm_api_key.txt"
+        if [ ! -f "${VLLM_API_KEY_FILE}" ]; then
+            (umask 077 && openssl rand -hex 32 > "${VLLM_API_KEY_FILE}")
+            chown_svc "${VLLM_API_KEY_FILE}"
+            log "Generated VLLM API key."
+        fi
+    fi
+
     if is_hub; then
         local DB_PASSWORD_FILE="${SECRETS_DIR}/db_password.txt"
         local LITELLM_MASTER_KEY_FILE="${SECRETS_DIR}/litellm_master_key.txt"
@@ -661,15 +701,6 @@ generate_secrets() {
         } > "${env_file}"
         chmod 600 "${env_file}"
         chown_svc "${env_file}"
-    fi
-
-    if is_worker; then
-        local VLLM_API_KEY_FILE="${SECRETS_DIR}/vllm_api_key.txt"
-        if [ ! -f "${VLLM_API_KEY_FILE}" ]; then
-            (umask 077 && openssl rand -hex 32 > "${VLLM_API_KEY_FILE}")
-            chown_svc "${VLLM_API_KEY_FILE}"
-            log "Generated VLLM API key."
-        fi
     fi
 }
 
@@ -990,6 +1021,7 @@ deploy_worker() {
 main() {
     parse_args "$@"
     validate_mode
+    step "Checking prerequisites"
     check_prerequisites
     touch_generated_dir
 
@@ -999,43 +1031,60 @@ main() {
             exit 1
         fi
         touch_secrets_dir
+        step "Fetching worker API keys"
         sync_worker_keys
+        step "Regenerating LiteLLM config"
         generate_litellm_config
         # Re-apply the stack with regenerated config; hub.env retains NODE_IP
         # and the new VLLM_KEY_* entries, so no re-prompting is needed.
         docker compose -f "${SCRIPT_DIR}/docker-compose.hub.yml" \
             --env-file "${SECRETS_DIR}/hub.env" \
             up -d --remove-orphans
+        step "Restarting LiteLLM"
+        wait_healthy "litellm-proxy" "LiteLLM"
         log "Worker keys synced and LiteLLM restarted."
         return 0
     fi
 
+    step "Collecting configuration"
     collect_user_input
 
+    step "Creating service user"
     create_service_user
+    step "Preparing Docker network"
     create_network
+    step "Configuring firewall"
     setup_firewall
+    step "Generating secrets"
     generate_secrets
 
     if is_hub; then
+        step "Syncing worker keys and generating LiteLLM config"
         sync_worker_keys
         generate_litellm_config
     fi
 
+    step "Starting services"
     if is_worker; then
         deploy_worker
-        # The hub needs this node's key to authenticate; prompt to push it now.
-        echo ""
-        log "Next step on the HUB node, run: sudo ./infrastructure/deploy.sh --sync-keys"
-        log "so it can fetch this node's API key and route to it."
     fi
-
     if is_hub; then
         deploy_hub
-        # Persist node config after services are up
-        update_inventory
     fi
 
+    step "Waiting for services to become healthy"
+    if is_hub; then
+        wait_healthy "litellm-postgres" "Postgres"
+        wait_healthy "litellm-proxy" "LiteLLM"
+    fi
+    if is_worker; then
+        wait_healthy "vllm-${NODE_ID}" "vLLM (${served_model_name:-model})"
+    fi
+
+    step "Recording node in inventory"
+    if is_hub; then
+        update_inventory
+    fi
     setup_nfs
 
     log ""
@@ -1048,6 +1097,10 @@ main() {
     fi
     if is_worker; then
         log "vLLM worker active on port: ${VLLM_PORT}"
+        log "Model download/loading continues in the background on first run:"
+        log "  docker logs -f vllm-${NODE_ID}"
+        log "Next step on the HUB node, run: sudo ./infrastructure/deploy.sh --sync-keys"
+        log "so it can fetch this node's API key and route to it."
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - vLLM may be exposed to LAN"
         fi
