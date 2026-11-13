@@ -57,6 +57,168 @@ sudo ./scripts/rollback.sh --yes
 
 ---
 
+## Installation & Pull Guide
+
+Practical deployment steps reflecting what the scripts actually do today,
+including known rough edges — see [Known issues you will hit](#known-issues-you-will-hit) before your first run.
+
+### Prerequisites (per node)
+
+- DGX Spark (GB10, arm64) with NVIDIA drivers and `nvidia-smi` working
+- Docker installed and the daemon running (`docker info` succeeds)
+- `git` and `openssl`
+- `yq` (mikefarah Go version) and `curl` — the deploy script tries to
+  `apt-get install yq` for you when running with sudo
+- Root (sudo) access on the node
+- Network reachability to the other nodes' LAN IPs and outbound internet
+  (model and image pulls)
+
+### Pull / update the kit
+
+```bash
+git clone https://github.com/e-bobbins/DGX-Spark-Insanity
+cd DGX-Spark-Insanity/spark-kits/spark-kit-3
+
+# later, to update:
+git pull
+sudo ./infrastructure/deploy.sh   # re-run; secrets are reused if present
+```
+
+Everything runs from this one directory on the node itself. No files are
+copied between machines; secrets are generated locally on each node and stay
+there (`secrets/` is gitignored — verify it is untracked with
+`git status --ignored`).
+
+### 1. Hub node (usually your first / main Spark)
+
+```bash
+sudo ./infrastructure/deploy.sh
+```
+
+Answer the prompts:
+
+| Prompt | What to answer |
+|---|---|
+| Node IP | Accept the auto-detected IP if correct |
+| Node role | `1` = Hub + Worker (recommended: hub also serves a model), `2` = Hub only, `3` = Worker only |
+| Client subnets (hub only) | Space-separated CIDRs that may reach LiteLLM, e.g. `10.0.0.0/24 192.168.1.0/24` |
+| Node ID | Enter or press Enter to auto-generate from the IP |
+| Model recipe (worker role only) | Enter for the default `qwen3.6-35b-a3b-nvfp4` |
+
+The script then: creates the `llm-svc` service user, configures the firewall
+(default deny incoming; SSH + LiteLLM 4000 from client subnets; vLLM 8000 from
+the hub IP only; outgoing allowed), generates secrets into `secrets/`,
+starts LiteLLM + Postgres via `docker-compose.hub.yml`, and starts the vLLM
+container if you chose a worker role.
+
+Equivalent via make: `make deploy`
+
+### 2. Each worker node
+
+Same procedure on every other Spark:
+
+```bash
+sudo ./infrastructure/deploy.sh
+```
+
+Choose role `3` (Worker only) and enter the **hub node's IP** when prompted.
+The vLLM port is firewalled to accept traffic from the hub IP only.
+
+### 3. Non-sudo mode (testing only — not for production)
+
+```bash
+./infrastructure/deploy.sh --non-sudo
+```
+
+Degraded on purpose: no firewall, no service user, containers run as your
+user, port 8000 binds to `0.0.0.0`. Requires the Docker network to exist:
+
+```bash
+sudo docker network create spark-kit-llm-net
+```
+
+### Using the stack (students / client apps)
+
+One OpenAI-compatible endpoint, from any client subnet:
+
+```bash
+BASE=http://<hub-ip>:4000/v1
+KEY=$(sudo cat /path/to/spark-kit-3/secrets/litellm_master_key.txt)
+
+curl $BASE/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.6-35b-a3b-nvfp4", "messages": [{"role":"user","content":"hello"}]}'
+```
+
+Per-user virtual keys (spend tracking, budgets) are issued through LiteLLM's
+admin surface backed by Postgres — create users/keys via the LiteLLM admin UI
+or `/key/generate` with the master key; that is the documented stage-1
+procedure (no automated issuance yet).
+
+### Rollback (per node)
+
+```bash
+sudo ./scripts/rollback.sh            # interactive
+sudo ./scripts/rollback.sh --yes              # no prompt
+sudo ./scripts/rollback.sh --yes --keep-firewall
+```
+
+Stops and removes this node's containers, removes the Docker network if
+unused, removes this node's firewall rules, and deletes `generated/`. Secrets
+are preserved for redeploy. **On a hub, the Postgres data volume is removed —
+data is not recoverable.** Other nodes are untouched.
+
+### Known issues you will hit
+
+These are known defects in the current commit, not steps you got wrong:
+
+1. **LiteLLM cannot reach Postgres.** The generated `DATABASE_URL` uses
+   `localhost:5432`, which inside the LiteLLM container points at itself, not
+   the `postgres` service. First boot fails database connection. Workaround:
+   edit `secrets/hub.env` to use host `postgres` and re-run
+   `docker compose -f infrastructure/docker-compose.hub.yml --env-file secrets/hub.env up -d`.
+2. **Hub → worker auth is broken.** Each worker generates its own vLLM API
+   key, but the hub's generated config only ever references its own
+   `VLLM_API_KEY` (which `hub.env` doesn't even define). Requests proxied to
+   any worker fail 401. Workaround: copy each worker's
+   `secrets/vllm_api_key.txt` value to the hub, add
+   `VLLM_API_KEY=<worker key>` to `secrets/hub.env` (one variable — this
+   forces a single shared key, sacrificing per-worker key isolation), and
+   restart the LiteLLM container.
+3. **Images are not pinned.** vLLM uses `:latest`; the pinned LiteLLM tag
+   (`v1.65.0`) is an unverified image reference. Expect drift between nodes
+   pulled at different times until digests are pinned.
+4. **The inventory is not updated by deploys.** `nodes:` stays empty and
+   `generated:` holds sample data; multi-node config generation therefore
+   only reflects what you hand-edit. Keep `inventory.yaml` in sync by hand
+   for now.
+5. **`verify.sh` reports false results** (port-binding and permission checks
+   fail on correct deployments; the worker-reachability check passes either
+   way).
+6. **vLLM container has no dedicated shm** (`--ipc`/`--shm-size` missing);
+   large-batch inference may abort with shared-memory errors. Workaround:
+   re-run the `docker run` from `deploy_worker` with `--ipc=host` or
+   `--shm-size=2g` after `docker rm vllm-<node>`.
+7. **NFS model cache advertised but not implemented** — with
+   `nfs.enabled: true` in the inventory, do not expect a shared cache; each
+   node downloads models independently.
+
+Track/fix status for these in the issue tracker; items 1–2 are blockers for
+any multi-node deployment.
+
+### Firewall quick reference
+
+| Node role | Allowed in | Notes |
+|---|---|---|
+| Hub | SSH; 4000/tcp from client subnets; 8000/tcp from own IP (if hub+worker) | Outgoing allowed |
+| Worker | SSH; 8000/tcp from hub IP only | Outgoing allowed |
+
+vLLM is unreachable from the rest of the LAN; LiteLLM :4000 is the only
+ingress for clients.
+
+---
+
 ## Deployment Modes
 
 The kit supports two deployment modes with different security characteristics:
