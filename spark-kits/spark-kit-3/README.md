@@ -8,6 +8,38 @@ This kit replaces both spark-kit and spark-kit-2. It resolves all identified bug
 
 ## Quick Start
 
+## Installation & Pull Guide
+
+Practical deployment steps reflecting what the scripts actually do today,
+including known rough edges — see [Known issues you will hit](#known-issues-you-will-hit) before your first run.
+
+### Prerequisites (per node)
+
+- DGX Spark (GB10, arm64) with NVIDIA drivers and `nvidia-smi` working
+- Docker installed and the daemon running (`docker info` succeeds)
+- `git` and `openssl`
+- `yq` (mikefarah Go version) and `curl` — the deploy script tries to
+  `apt-get install yq` for you when running with sudo
+- Root (sudo) access on the node
+- Network reachability to the other nodes' LAN IPs and outbound internet
+  (model and image pulls)
+
+### Pull / update the kit
+
+```bash
+git clone https://github.com/e-bobbins/DGX-Spark-Insanity
+cd DGX-Spark-Insanity/spark-kits/spark-kit-3
+
+# later, to update:
+git pull
+sudo ./infrastructure/deploy.sh   # re-run; secrets are reused if present
+```
+
+Everything runs from this one directory on the node itself. No files are
+copied between machines; secrets are generated locally on each node and stay
+there (`secrets/` is gitignored — verify it is untracked with
+`git status --ignored`).
+
 ### Secure Mode (Recommended)
 
 For production deployments with full security:
@@ -57,37 +89,6 @@ sudo ./scripts/rollback.sh --yes
 
 ---
 
-## Installation & Pull Guide
-
-Practical deployment steps reflecting what the scripts actually do today,
-including known rough edges — see [Known issues you will hit](#known-issues-you-will-hit) before your first run.
-
-### Prerequisites (per node)
-
-- DGX Spark (GB10, arm64) with NVIDIA drivers and `nvidia-smi` working
-- Docker installed and the daemon running (`docker info` succeeds)
-- `git` and `openssl`
-- `yq` (mikefarah Go version) and `curl` — the deploy script tries to
-  `apt-get install yq` for you when running with sudo
-- Root (sudo) access on the node
-- Network reachability to the other nodes' LAN IPs and outbound internet
-  (model and image pulls)
-
-### Pull / update the kit
-
-```bash
-git clone https://github.com/e-bobbins/DGX-Spark-Insanity
-cd DGX-Spark-Insanity/spark-kits/spark-kit-3
-
-# later, to update:
-git pull
-sudo ./infrastructure/deploy.sh   # re-run; secrets are reused if present
-```
-
-Everything runs from this one directory on the node itself. No files are
-copied between machines; secrets are generated locally on each node and stay
-there (`secrets/` is gitignored — verify it is untracked with
-`git status --ignored`).
 
 ### 1. Hub node (usually your first / main Spark)
 
