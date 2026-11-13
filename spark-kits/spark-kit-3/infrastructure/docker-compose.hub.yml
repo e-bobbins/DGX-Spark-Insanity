@@ -64,5 +64,7 @@ volumes:
 
 networks:
   llm-net:
-    driver: bridge
+    # Created by deploy.sh (docker network create) and shared with the
+    # docker-run worker containers; compose must not manage its labels.
+    external: true
     name: spark-kit-llm-net
