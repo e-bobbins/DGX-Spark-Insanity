@@ -59,6 +59,7 @@ MODEL_RECIPE=""
 NON_SUDO_MODE=false
 USE_CURRENT_USER=false
 SYNC_KEYS_ONLY=false
+RESTART_ONLY=false
 
 # --- Functions ---
 
@@ -144,6 +145,10 @@ parse_args() {
                 SYNC_KEYS_ONLY=true
                 shift
                 ;;
+            --restart-services)
+                RESTART_ONLY=true
+                shift
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -164,11 +169,15 @@ Usage: ./deploy.sh [OPTIONS]     OR     sudo ./deploy.sh
 Deploy the DGX Spark LLM Stack on the current node.
 
 Options:
-  --non-sudo      Run without sudo (degraded security, testing only)
-  --sync-keys     Hub only: fetch worker API keys over scp, regenerate
-                  the LiteLLM config, and restart the LiteLLM container.
-                  Run this after deploying new/re-keyed workers.
-  --help, -h      Show this help message and exit
+  --non-sudo          Run without sudo (degraded security, testing only)
+  --sync-keys         Hub only: fetch worker API keys over scp, regenerate
+                      the LiteLLM config, and restart the LiteLLM container.
+                      Run this after deploying new/re-keyed workers.
+  --restart-services  Skip all prompts. Look this node's role/recipe up in
+                      the inventory (by its IP) and re-apply its stack with
+                      existing secrets and config. Fails if the node was
+                      never deployed here.
+  --help, -h          Show this help message and exit
 
 The script will prompt you for all required information interactively.
 EOF
@@ -916,6 +925,17 @@ deploy_hub() {
     log "Starting Hub services via Docker Compose..."
     cd "${SCRIPT_DIR}"
 
+    # Re-deploy safety: stale containers with these fixed names (e.g. from an
+    # interrupted earlier `up`) make compose abort with a name conflict.
+    # Removing them keeps the postgres_data named volume, so no data is lost.
+    local stale_container
+    for stale_container in litellm-proxy litellm-postgres; do
+        if docker ps -a --format '{{.Names}}' | grep -qx "${stale_container}"; then
+            log "Reusing name: removing stale container ${stale_container} (volumes preserved)"
+            docker rm -f "${stale_container}" > /dev/null
+        fi
+    done
+
     docker compose -f "${docker_compose_file}" \
         --env-file "${env_file}" \
         up -d --remove-orphans
@@ -973,14 +993,18 @@ deploy_worker() {
 
     log "Starting vLLM container for model: ${served_model_name}"
 
-    # Preflight: pull the pinned image now so a bad tag / registry problem
-    # fails here with an actionable message instead of inside docker run.
-    log "Pulling worker image ${VLLM_IMAGE} (first pull is ~8.5 GB on arm64)..."
-    if ! docker pull "${VLLM_IMAGE}"; then
-        log_error "Could not pull ${VLLM_IMAGE}."
-        log_error "Check the image reference and tag format; NGC tags look like 26.10-py3."
-        log_error "If the tag has moved on, update VLLM_IMAGE in infrastructure/deploy.sh and re-run."
-        exit 1
+    # Preflight: ensure the pinned image is usable. Skipped when already
+    # pulled locally (use rollback + redeploy to force a fresh pull).
+    if docker image inspect "${VLLM_IMAGE}" > /dev/null 2>&1; then
+        log "Using already-pulled image ${VLLM_IMAGE}"
+    else
+        log "Pulling worker image ${VLLM_IMAGE} (first pull is ~8.5 GB on arm64)..."
+        if ! docker pull "${VLLM_IMAGE}"; then
+            log_error "Could not pull ${VLLM_IMAGE}."
+            log_error "Check the image reference and tag format; NGC tags look like 26.10-py3."
+            log_error "If the tag has moved on, update VLLM_IMAGE in infrastructure/deploy.sh and re-run."
+            exit 1
+        fi
     fi
 
     local port_flags=()
@@ -1028,6 +1052,32 @@ deploy_worker() {
     log "vLLM serving ${served_model_name} at http://${NODE_IP}:${VLLM_PORT}/v1"
 }
 
+# Load this node's identity from the inventory (by IP) for --restart-services
+load_node_from_inventory() {
+    local ip
+    ip=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+    [ -z "${ip}" ] && { log_error "Could not detect this node's IP."; exit 1; }
+
+    NODE_ID=$(yq eval ".nodes[] | select(.lan_ip == \"${ip}\") | .node_id" "${INVENTORY_FILE}" 2>/dev/null || true)
+    if [ -z "${NODE_ID}" ]; then
+        log_error "No inventory entry for IP ${ip} on this node. Run the full interactive deploy first."
+        exit 1
+    fi
+    NODE_IP="${ip}"
+    NODE_ROLE=$(yq eval ".nodes[] | select(.node_id == \"${NODE_ID}\") | .role" "${INVENTORY_FILE}")
+    MODEL_RECIPE=$(yq eval ".nodes[] | select(.node_id == \"${NODE_ID}\") | .model_recipe" "${INVENTORY_FILE}" 2>/dev/null || true)
+    if [ "${MODEL_RECIPE}" = "null" ]; then MODEL_RECIPE=""; fi
+    HUB_LAN_IP=$(yq eval '.nodes[] | select(.role == "hub" or .role == "hub+worker") | .lan_ip' "${INVENTORY_FILE}" 2>/dev/null | head -1)
+    HUB_LAN_IP="${HUB_LAN_IP:-${NODE_IP}}"
+    local subnets
+    subnets=$(yq eval '.lab.client_subnets // [] | join(" ")' "${INVENTORY_FILE}" 2>/dev/null || true)
+    if [ -n "${subnets}" ]; then
+        # shellcheck disable=SC2206
+        CLIENT_SUBNETS=(${subnets})
+    fi
+    log "Restarting: ${NODE_ID} role=${NODE_ROLE} ip=${NODE_IP} recipe=${MODEL_RECIPE:-none}"
+}
+
 # Main deployment
 main() {
     parse_args "$@"
@@ -1035,6 +1085,29 @@ main() {
     step "Checking prerequisites"
     check_prerequisites
     touch_generated_dir
+
+    if [ "${RESTART_ONLY}" = true ]; then
+        step "Reading node configuration from inventory"
+        load_node_from_inventory
+        step "Preparing service user and secrets"
+        create_service_user
+        generate_secrets   # idempotent: reuses secret files, rebuilds env files
+        step "Starting services"
+        if is_worker; then deploy_worker; fi
+        if is_hub; then deploy_hub; fi
+        step "Waiting for services to become healthy"
+        if is_hub; then
+            wait_healthy "litellm-postgres" "Postgres"
+            wait_healthy "litellm-proxy" "LiteLLM"
+        fi
+        if is_worker; then
+            wait_healthy "vllm-${NODE_ID}" "vLLM (${served_model_name:-model})"
+        fi
+        log ""
+        log "=== Services restarted ==="
+        log "To verify deployment, run: ./scripts/verify.sh"
+        return 0
+    fi
 
     if [ "${SYNC_KEYS_ONLY}" = true ]; then
         if [ ! -f "${SECRETS_DIR}/hub.env" ]; then
