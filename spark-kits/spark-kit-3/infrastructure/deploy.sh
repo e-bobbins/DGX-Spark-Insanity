@@ -40,9 +40,10 @@ DOCKER_NETWORK="spark-kit-llm-net"
 
 # Pinned images (arm64-capable, GB10-compatible).
 # Single source of truth: docker-compose.hub.yml consumes these via env-file.
-# - vLLM: NVIDIA NGC multi-arch image (linux/arm64 build verified for 26.10).
+# - vLLM: NVIDIA NGC multi-arch image. NGC tags are YY.MM-py3 format; the
+#   linux/arm64 build is included (verified for 26.10-py3, signed).
 # - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
-VLLM_IMAGE="nvcr.io/nvidia/vllm:26.10"
+VLLM_IMAGE="nvcr.io/nvidia/vllm:26.10-py3"
 LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.83.7-stable"
 POSTGRES_IMAGE="pgvector/pgvector:pg17"
 
@@ -971,6 +972,16 @@ deploy_worker() {
     fi
 
     log "Starting vLLM container for model: ${served_model_name}"
+
+    # Preflight: pull the pinned image now so a bad tag / registry problem
+    # fails here with an actionable message instead of inside docker run.
+    log "Pulling worker image ${VLLM_IMAGE} (first pull is ~8.5 GB on arm64)..."
+    if ! docker pull "${VLLM_IMAGE}"; then
+        log_error "Could not pull ${VLLM_IMAGE}."
+        log_error "Check the image reference and tag format; NGC tags look like 26.10-py3."
+        log_error "If the tag has moved on, update VLLM_IMAGE in infrastructure/deploy.sh and re-run."
+        exit 1
+    fi
 
     local port_flags=()
     if [ "${NON_SUDO_MODE}" = true ]; then
