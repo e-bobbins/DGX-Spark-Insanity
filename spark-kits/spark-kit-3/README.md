@@ -124,6 +124,21 @@ sudo ./infrastructure/deploy.sh
 Choose role `3` (Worker only) and enter the **hub node's IP** when prompted.
 The vLLM port is firewalled to accept traffic from the hub IP only.
 
+### 3. Sync worker keys to the hub (required for multi-node)
+
+After deploying workers, run this **on the hub** so it can authenticate to
+each worker's vLLM:
+
+```bash
+sudo ./infrastructure/deploy.sh --sync-keys
+```
+
+It fetches each worker's `secrets/vllm_api_key.txt` over `scp` (you'll be
+prompted for the ssh target and remote path per worker), stores copies in
+`secrets/worker_keys/` (mode 600, gitignored), regenerates the LiteLLM
+config with one route and one dedicated key variable per worker, and
+restarts LiteLLM. Re-run it whenever a worker is re-keyed or added.
+
 ### 3. Non-sudo mode (testing only — not for production)
 
 ```bash
@@ -171,41 +186,20 @@ data is not recoverable.** Other nodes are untouched.
 
 ### Known issues you will hit
 
-These are known defects in the current commit, not steps you got wrong:
+The issues tracked in the repository issue tracker (#2–#9) were fixed in the
+same change that added this guide. Remaining operational notes:
 
-1. **LiteLLM cannot reach Postgres.** The generated `DATABASE_URL` uses
-   `localhost:5432`, which inside the LiteLLM container points at itself, not
-   the `postgres` service. First boot fails database connection. Workaround:
-   edit `secrets/hub.env` to use host `postgres` and re-run
-   `docker compose -f infrastructure/docker-compose.hub.yml --env-file secrets/hub.env up -d`.
-2. **Hub → worker auth is broken.** Each worker generates its own vLLM API
-   key, but the hub's generated config only ever references its own
-   `VLLM_API_KEY` (which `hub.env` doesn't even define). Requests proxied to
-   any worker fail 401. Workaround: copy each worker's
-   `secrets/vllm_api_key.txt` value to the hub, add
-   `VLLM_API_KEY=<worker key>` to `secrets/hub.env` (one variable — this
-   forces a single shared key, sacrificing per-worker key isolation), and
-   restart the LiteLLM container.
-3. **Images are not pinned.** vLLM uses `:latest`; the pinned LiteLLM tag
-   (`v1.65.0`) is an unverified image reference. Expect drift between nodes
-   pulled at different times until digests are pinned.
-4. **The inventory is not updated by deploys.** `nodes:` stays empty and
-   `generated:` holds sample data; multi-node config generation therefore
-   only reflects what you hand-edit. Keep `inventory.yaml` in sync by hand
-   for now.
-5. **`verify.sh` reports false results** (port-binding and permission checks
-   fail on correct deployments; the worker-reachability check passes either
-   way).
-6. **vLLM container has no dedicated shm** (`--ipc`/`--shm-size` missing);
-   large-batch inference may abort with shared-memory errors. Workaround:
-   re-run the `docker run` from `deploy_worker` with `--ipc=host` or
-   `--shm-size=2g` after `docker rm vllm-<node>`.
-7. **NFS model cache advertised but not implemented** — with
-   `nfs.enabled: true` in the inventory, do not expect a shared cache; each
-   node downloads models independently.
-
-Track/fix status for these in the issue tracker; items 1–2 are blockers for
-any multi-node deployment.
+1. **Worker key sync is manual by design.** After deploying (or re-keying) a
+   worker, run `sudo ./infrastructure/deploy.sh --sync-keys` on the hub.
+   Routes to a worker without a synced key fail auth.
+2. **Image pins are version tags, not digests.** vLLM is pinned to NVIDIA's
+   NGC multi-arch image `nvcr.io/nvidia/vllm:26.10` and LiteLLM to
+   `ghcr.io/berriai/litellm:v1.83.7-stable`; pin digests for stricter
+   reproducibility.
+3. **Offline tests cover config generation only.** `tests/run-tests.sh`
+   runs shellcheck plus an offline config-generation test with a stubbed
+   `yq`. Full end-to-end validation (real GPU load, LiteLLM routing) still
+   requires an on-node run of `scripts/verify.sh`.
 
 ### Firewall quick reference
 
@@ -288,6 +282,10 @@ spark-kit-3/
 ├── scripts/
 │   ├── verify.sh               # Verification script (no secrets printed)
 │   └── rollback.sh              # Per-node rollback
+│
+├── tests/
+│   ├── run-tests.sh            # Offline harness: shellcheck + config-gen tests
+│   └── stubs/                  # Test-only yq stub (not a general yq)
 │
 ├── recipes/
 │   ├── README.md               # Recipe documentation
@@ -486,21 +484,20 @@ All secrets are **generated on the node that uses them**:
 
 ## NFS Model Cache (Optional)
 
-By default, NFS cache is **enabled** in inventory.yaml.
+Off by default (`lab.nfs.enabled: false` in `inventory.yaml`). When enabled:
 
-### Hub (NFS Server):
-```bash
-# Export is automatically configured by deploy.sh
-# /mnt/shared-models is shared read-write
-```
+### Hub (NFS Server)
+`deploy.sh` writes `/etc/exports.d/spark-kit-3.exports` with `root_squash`,
+restricted to the configured client subnets, and runs `exportfs -ra`. The
+NFS server package (`nfs-kernel-server`) must be installed; if it is not,
+the deploy warns and continues.
 
-### Workers:
-```bash
-# /mnt/shared-models is automatically mounted read-only
-# vLLM uses HF_HUB_CACHE=/mnt/shared-models
-```
+### Workers
+`deploy.sh` attempts a **read-only** mount of the export and points
+`HF_HUB_CACHE` at it when mounted. If the mount fails, the worker falls back
+to downloading models independently — deployment is not blocked.
 
-If NFS is unavailable, workers download models independently.
+Set `lab.nfs.enabled: true` before deploying to use this.
 
 ---
 

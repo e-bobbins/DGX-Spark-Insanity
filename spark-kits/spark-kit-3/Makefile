@@ -39,10 +39,6 @@ rollback: ## Rollback deployment on current node (sudo mode)
 	@echo "Run: sudo ./scripts/rollback.sh"
 	sudo ./scripts/rollback.sh
 
-rollback-non-sudo: ## Rollback deployment on current node (non-sudo mode)
-	@echo "Rolling back deployment (non-sudo mode)..."
-	./scripts/rollback.sh --non-sudo
-
 clean: ## Remove generated files and secrets (local only)
 	@echo "Cleaning generated files and secrets..."
 	rm -rf generated/ secrets/
@@ -56,6 +52,9 @@ deploy-worker: ## Deploy worker on current node (sudo mode)
 	sudo ./infrastructure/deploy.sh
 
 # Shellcheck for all scripts
+test: ## Run offline test harness (shellcheck + config-generation tests)
+	./tests/run-tests.sh
+
 shellcheck: ## Run shellcheck on all shell scripts
 	@echo "Running shellcheck..."
 	find . -name "*.sh" -type f | while read -r script; do \

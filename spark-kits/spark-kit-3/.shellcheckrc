@@ -1,32 +1,10 @@
 # ShellCheck configuration for DGX Spark LLM Stack
 # https://www.shellcheck.net/wiki/Configuration
+#
+# Kept strict on purpose: the two historical bugs in earlier kits
+# (readonly UID assignment, comments inside line continuations) and the
+# truncated-command bug are all in the class of issues shellcheck flags.
+# Do not widen these exclusions without a written justification here.
 
-# Severity levels: error, warning, info, style
-
-# Treat all warnings as errors (strict mode)
-severity=error
-
-# Exclude specific checks (if needed)
-# SC1090: Can't follow non-constant source. Use a directive to specify location.
-# We use source for environment files, which is fine.
+# SC1090: can't follow non-constant source (we source env files at runtime)
 exclude=SC1090
-
-# SC2155: Declare and assign separately to avoid masking return values.
-# We do this intentionally for command substitution in deploy scripts.
-exclude=SC2155
-
-# SC2086: Double quote to prevent globbing and word splitting.
-# Some arrays and command substitutions are intentional.
-exclude=SC2086
-
-# SC2164: Use 'cd ... || exit' or 'cd ... || return' to handle cd failures.
-# Our scripts use set -e, so cd failures will exit anyway.
-exclude=SC2164
-
-# SC2046: Quote to prevent word splitting/globbing, or split robustly.
-# We use yq output which is intentionally split.
-exclude=SC2046
-
-# SC2129: Consider using { cmd1; cmd2; } >> file instead of individual appends.
-# We do individual appends for clarity inWI config generation.
-exclude=SC2129

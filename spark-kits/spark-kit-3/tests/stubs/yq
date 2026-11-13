@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Minimal yq stub for the offline test harness (tests/run-tests.sh).
+
+Implements only the exact Mike Farah yq expressions spark-kit-3 scripts use.
+This lets config-generation logic be exercised without installing yq or
+running Docker. NOT a general yq replacement.
+"""
+import json
+import os
+import re
+import sys
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        # strip document marker
+        text = f.read().replace("\n---\n", "\n")
+    return yaml_fallback(text)
+
+
+def yaml_fallback(text):
+    """Tiny YAML subset parser: nested maps, lists of scalars/flow-maps."""
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        line = raw.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if line.startswith("- "):
+            item = line[2:].strip()
+            lst = parent.setdefault("__list__", [])
+            if item.startswith("{"):
+                item = item[1:-1]
+                d = {}
+                for kv in item.split(","):
+                    k, v = kv.split(":", 1)
+                    d[k.strip().strip('"')] = v.strip().strip('"')
+                lst.append(d)
+            elif ":" in item:
+                k, v = item.split(":", 1)
+                d = {k.strip().strip('"'): v.strip().strip('"')}
+                lst.append(d)
+            else:
+                lst.append(item.strip('"'))
+            if "__list__" in parent and isinstance(parent, dict):
+                pass
+            stack.append((indent, lst[-1] if isinstance(lst[-1], dict) else parent))
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip().strip('"')
+            v = v.strip()
+            if v == "" or v == "[]":
+                parent[k] = [] if v == "[]" else {}
+                stack.append((indent, parent[k]))
+            else:
+                parent[k] = v.strip('"')
+    return root
+
+
+def normalize(node):
+    """Convert {'__list__': [...]} placeholders produced by the parser back into lists."""
+    if isinstance(node, dict):
+        if set(node.keys()) == {"__list__"}:
+            return [normalize(x) for x in node["__list__"]]
+        return {k: normalize(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [normalize(x) for x in node]
+    return node
+
+
+def resolve(node, path):
+    path = path.strip()
+    if path.startswith("."):
+        path = path[1:]
+    if not path:
+        return node
+    key, _, rest = path.partition(".")
+    key = key.strip()
+    if isinstance(node, dict):
+        return resolve(node.get(key), rest)
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    inplace = False
+    if args and args[0] in ("eval", "-i"):
+        if args[0] == "-i":
+            inplace = True
+            args = args[1:]
+        args = args[1:]
+    expr = args[0] if args else "."
+    files = [a for a in args[1:] if not a.startswith("-")]
+    doc = load(files[0]) if files else {}
+    doc = normalize(doc)
+
+    out = []
+
+    # .nodes[] | select(.role == "worker") | "\(.a)|\(.b)"
+    m = re.match(r'^\.nodes\[\]\s*\|\s*select\(\.(\w+)\s*==\s*"([^"]+)"\)\s*\|\s*"(.*)"$', expr)
+    if m:
+        key, val, tmpl = m.group(1), m.group(2), m.group(3)
+        for node in doc.get("nodes", []):
+            if str(node.get(key)) == val:
+                out.append(re.sub(r"\\\(\.?(\w+)\)", lambda mm: str(node.get(mm.group(1), "")), tmpl))
+    # .nodes[] | select(.a == "X") | .b
+    elif re.match(r'^\.nodes\[\]\s*\|\s*select\(', expr):
+        m2 = re.match(r'^\.nodes\[\]\s*\|\s*select\(\.(\w+)\s*==\s*"([^"]+)"\)\s*\|\s*\.(\w+)$', expr)
+        if m2:
+            for node in doc.get("nodes", []):
+                if str(node.get(m2.group(1))) == m2.group(2):
+                    v = node.get(m2.group(3))
+                    if v is not None:
+                        out.append(str(v))
+    # .nodes[].node_id  /  .lab.client_subnets[]
+    elif re.match(r"^\.[\w.]+\[\]$", expr):
+        out.extend(str(x) for x in (resolve(doc, expr[:-2]) or []))
+    elif expr == ".nodes[].node_id":
+        out.extend(str(n.get("node_id")) for n in doc.get("nodes", []) if n.get("node_id"))
+    # .a.b // default
+    elif "//" in expr:
+        path, default = [p.strip() for p in expr.split("//", 1)]
+        v = resolve(doc, path)
+        if v in (None, "", "null", "[]"):
+            default = default.strip('"\'')
+            out.append({"false": "false", "true": "true"}.get(default, default))
+        else:
+            out.append(str(v))
+    elif expr == ".nodes | length":
+        out.append(str(len(doc.get("nodes", []))))
+    elif expr.startswith("."):
+        v = resolve(doc, expr)
+        if v is not None:
+            out.append(str(v))
+    # in-place edits used by update_inventory
+    elif inplace and "del(" in expr:
+        pass
+    elif inplace and ".nodes +=" in expr:
+        m3 = re.search(r'\{"node_id": env\((\w+)\), "role": env\((\w+)\), "lan_ip": env\((\w+)\), "model_recipe": (env\(\w+\)|null)\}', expr)
+        if m3:
+            node = {
+                "node_id": os.environ.get(m3.group(1), ""),
+                "role": os.environ.get(m3.group(2), ""),
+                "lan_ip": os.environ.get(m3.group(3), ""),
+                "model_recipe": (os.environ.get(m3.group(4)[4:-1], "") ) if m3.group(4).startswith("env") else None,
+            }
+            doc.setdefault("nodes", []).append(node)
+            with open(files[0], "w", encoding="utf-8") as f:
+                f.write("\n")  # placeholder; tests assert via returned node only
+            out.append("ok")
+
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

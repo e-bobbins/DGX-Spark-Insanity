@@ -17,7 +17,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INVENTORY_FILE="${KIT_DIR}/inventory.yaml"
 GENERATED_DIR="${KIT_DIR}/generated"
-SECRETS_DIR="${KIT_DIR}/secrets"
 
 # Docker network
 DOCKER_NETWORK="spark-kit-llm-net"

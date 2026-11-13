@@ -6,6 +6,7 @@
 #
 # Usage (Secure - Recommended):
 #   sudo ./deploy.sh                    # Full interactive mode with sudo
+#   sudo ./deploy.sh --sync-keys        # Re-pull worker API keys and regenerate config
 #
 # Usage (Non-Sudo - Degraded Security):
 #   ./deploy.sh --non-sudo             # Non-sudo mode with warnings
@@ -37,11 +38,13 @@ SERVICE_GROUP="llm-svc"
 # Docker network
 DOCKER_NETWORK="spark-kit-llm-net"
 
-# Pinned images (GB10-capable, arm64-compatible)
-# Using stable version tags - replace with actual digests for production
-VLLM_IMAGE="vllm/vllm-openai:latest"  # arm64-capable, GB10-compatible
+# Pinned images (arm64-capable, GB10-compatible).
+# Single source of truth: docker-compose.hub.yml consumes these via env-file.
+# - vLLM: NVIDIA NGC multi-arch image (linux/arm64 build verified for 26.10).
+# - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
+VLLM_IMAGE="nvcr.io/nvidia/vllm:26.10"
+LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.83.7-stable"
 POSTGRES_IMAGE="pgvector/pgvector:pg17"
-LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.65.0"
 
 # Global variables for user input
 NODE_ROLE=""
@@ -49,10 +52,12 @@ NODE_ID=""
 NODE_IP=""
 CLIENT_SUBNETS=()
 HUB_LAN_IP=""
+MODEL_RECIPE=""
 
 # Deployment mode
 NON_SUDO_MODE=false
 USE_CURRENT_USER=false
+SYNC_KEYS_ONLY=false
 
 # --- Functions ---
 
@@ -86,7 +91,7 @@ validate_mode() {
         log_warn "  - Docker network may not be created automatically"
         return 0
     fi
-    
+
     # Default: sudo mode
     if [ "$(id -u)" != "0" ]; then
         log_error "In sudo mode: This script must be run with sudo for security features."
@@ -102,6 +107,10 @@ parse_args() {
         case $1 in
             --non-sudo)
                 NON_SUDO_MODE=true
+                shift
+                ;;
+            --sync-keys)
+                SYNC_KEYS_ONLY=true
                 shift
                 ;;
             --help|-h)
@@ -122,25 +131,12 @@ show_help() {
 Usage: ./deploy.sh [OPTIONS]     OR     sudo ./deploy.sh
 
 Deploy the DGX Spark LLM Stack on the current node.
-This script supports two modes:
-
-SECURE MODE (Recommended):
-  sudo ./deploy.sh
-  - Full security enforcement
-  - Creates service user (llm-svc)
-  - Configures firewall automatically
-  - Requires root access
-
-NON-SUDO MODE (Degraded Security):
-  ./deploy.sh --non-sudo
-  - Runs without root
-  - Containers run as current user
-  - No firewall configuration
-  - No service isolation
-  - For testing/development only
 
 Options:
-  --non-sudo      Run without sudo (degraded security)
+  --non-sudo      Run without sudo (degraded security, testing only)
+  --sync-keys     Hub only: fetch worker API keys over scp, regenerate
+                  the LiteLLM config, and restart the LiteLLM container.
+                  Run this after deploying new/re-keyed workers.
   --help, -h      Show this help message and exit
 
 The script will prompt you for all required information interactively.
@@ -150,59 +146,56 @@ EOF
 # Check prerequisites
 check_prerequisites() {
     log "Checking prerequisites..."
-    
-    # Check Docker
-    if ! command -v docker &> /dev/null; then
-        log_error "Docker is not installed. Please install Docker and try again."
-        exit 1
+
+    # Check Docker (skip for pure config operations)
+    if [ "${SYNC_KEYS_ONLY}" = false ]; then
+        if ! command -v docker &> /dev/null; then
+            log_error "Docker is not installed. Please install Docker and try again."
+            exit 1
+        fi
+
+        if ! docker info &> /dev/null; then
+            log_error "Docker daemon is not running. Please start Docker and try again."
+            exit 1
+        fi
+
+        # GPU is only required when this node serves a model; checked after role is known.
+        if ! command -v nvidia-smi &> /dev/null; then
+            log_warn "NVIDIA GPU not detected. If this node serves a model, deployment will fail."
+        fi
     fi
-    
-    # Check Docker daemon
-    if ! docker info &> /dev/null; then
-        log_error "Docker daemon is not running. Please start Docker and try again."
-        exit 1
-    fi
-    
-    # Check for NVIDIA GPU
-    if ! nvidia-smi &> /dev/null; then
-        log_error "NVIDIA GPU not detected. This kit requires NVIDIA GPU drivers."
-        exit 1
-    fi
-    
+
     # Check inventory file
     if [ ! -f "${INVENTORY_FILE}" ]; then
         log_error "Inventory file not found at ${INVENTORY_FILE}"
         log_error "Please ensure you are in the spark-kit-3 directory."
         exit 1
     fi
-    
+
     # Check yq for YAML parsing (install if missing)
     if ! command -v yq &> /dev/null; then
         log "yq not found. Installing..."
         if command -v apt-get &> /dev/null && [ "${NON_SUDO_MODE}" = false ]; then
-            apt-get update -qq && apt-get install -y -qq yq 2>&1 | grep -v "^Selecting\|^Preparing\|^Unpacking\|^Setting"
-        elif command -v apk &> /dev/null && [ "${NON_SUDO_MODE}" = false ]; then
+            apt-get update -qq && apt-get install -y -qq yq 2>&1 | grep -v "^Selecting\|^Preparing\|^Unpacking\|^Setting" || true
+        elif command -v apk add &> /dev/null && [ "${NON_SUDO_MODE}" = false ]; then
             apk add --no-cache yq
         else
             log_error "Cannot install yq without root. Please install yq (https://github.com/mikefarah/yq) and try again."
             exit 1
         fi
     fi
-    
+
     log "All prerequisites met."
 }
 
-# Create generated directory
 touch_generated_dir() {
     mkdir -p "${GENERATED_DIR}"
     chmod 750 "${GENERATED_DIR}"
 }
 
-# Create secrets directory
 touch_secrets_dir() {
     mkdir -p "${SECRETS_DIR}"
-    
-    # In non-sudo mode, current user owns secrets
+
     if [ "${USE_CURRENT_USER}" = true ]; then
         chmod 700 "${SECRETS_DIR}"
     else
@@ -213,15 +206,14 @@ touch_secrets_dir() {
 
 # Detect or prompt for node IP
 prompt_node_ip() {
-    # Try to auto-detect IP
-    CURRENT_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-    
+    local CURRENT_IP
+    CURRENT_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+
     if [ -n "${CURRENT_IP}" ]; then
         read -r -p "Detected node IP: ${CURRENT_IP}. Is this correct? [Y/n]: " response
         case "${response}" in
             [nN])
                 read -r -p "Enter node IP address: " NODE_IP
-                NODE_IP="${NODE_IP}"
                 ;;
             *)
                 NODE_IP="${CURRENT_IP}"
@@ -230,12 +222,13 @@ prompt_node_ip() {
     else
         read -r -p "Enter node IP address: " NODE_IP
     fi
-    
+
     if [ -z "${NODE_IP}" ]; then
         log_error "Node IP is required."
         prompt_node_ip
+        return
     fi
-    
+
     log "Using node IP: ${NODE_IP}"
 }
 
@@ -243,56 +236,46 @@ prompt_node_ip() {
 prompt_role() {
     echo ""
     cat << EOF
+
 Select the role for this node:
 
   1. Hub + Worker (RECOMMENDED)
      - Runs LiteLLM (proxy) + Postgres + vLLM worker
      - This node will serve both as the central hub AND host a model
-     - Perfect for the main Spark node
 
   2. Hub only
      - Runs LiteLLM (proxy) + Postgres only
-     - This node coordinates workers but does NOT serve models itself
 
   3. Worker only
-     - Runs vLLM worker only
-     - This node serves a model and connects to the hub
+     - Runs vLLM worker only, connects to the hub
 
 EOF
-    
+
     read -r -p "Enter choice [1-3, default=1]: " choice
-    
+
     case "${choice:-1}" in
-        1)
-            NODE_ROLE="hub+worker"
-            IS_HUB=true
-            IS_WORKER=true
-            ;;
-        2)
-            NODE_ROLE="hub"
-            IS_HUB=true
-            IS_WORKER=false
-            ;;
-        3)
-            NODE_ROLE="worker"
-            IS_HUB=false
-            IS_WORKER=true
-            ;;
+        1) NODE_ROLE="hub+worker" ;;
+        2) NODE_ROLE="hub" ;;
+        3) NODE_ROLE="worker" ;;
         *)
             log_error "Invalid choice. Please enter 1, 2, or 3."
             prompt_role
+            return
             ;;
     esac
-    
+
     log "Selected role: ${NODE_ROLE}"
 }
 
+is_hub() { [[ "${NODE_ROLE}" == *hub* ]]; }
+is_worker() { [[ "${NODE_ROLE}" == *worker* ]]; }
+
 # Prompt for client subnets
 prompt_client_subnets() {
-    if [ "${IS_HUB}" != true ]; then
+    if ! is_hub; then
         return 0
     fi
-    
+
     echo ""
     cat << EOF
 Configure client subnets that will be allowed to access LiteLLM.
@@ -304,152 +287,168 @@ Examples:
   - Single subnet: 10.0.0.0/24
   - Multiple subnets: 10.0.0.0/24 192.168.1.0/24
 EOF
-    
+
     if [ "${NON_SUDO_MODE}" = true ]; then
         log_warn "In non-sudo mode: firewall will NOT be configured."
         log_warn "Client subnet configuration is for documentation only."
     fi
-    
-    read -r -p "Enter client subnet(s) separated by spaces: " input_subnets
-    
+
+    read -r -p "Enter client subnet(s) separated by spaces [default from inventory if set]: " input_subnets
+
+    if [ -z "${input_subnets}" ]; then
+        local configured
+        configured=$(yq eval '.lab.client_subnets // [] | join(" ")' "${INVENTORY_FILE}" 2>/dev/null || echo "")
+        if [ -n "${configured}" ]; then
+            input_subnets="${configured}"
+            log "Using client subnets from inventory: ${input_subnets}"
+        fi
+    fi
+
     if [ -z "${input_subnets}" ]; then
         log_error "At least one client subnet is required for hub deployment."
         prompt_client_subnets
+        return
     fi
-    
-    # Validate CIDR format
+
     CLIENT_SUBNETS=()
+    local subnet
     for subnet in ${input_subnets}; do
-        if [[ "$subnet" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-            CLIENT_SUBNETS+=("$subnet")
+        if [[ "${subnet}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            CLIENT_SUBNETS+=("${subnet}")
         else
-            log_error "Invalid CIDR notation: $subnet. Expected format: X.X.X.X/XX"
+            log_error "Invalid CIDR notation: ${subnet}. Expected format: X.X.X.X/XX"
             prompt_client_subnets
             return
         fi
     done
-    
+
     log "Client subnets: ${CLIENT_SUBNETS[*]}"
 }
 
 # Prompt for hub IP if this is a worker
 prompt_hub_ip() {
-    if [ "${IS_HUB}" = true ]; then
+    if is_hub; then
         HUB_LAN_IP="${NODE_IP}"
         return 0
     fi
-    
-    # This is a worker node, need hub IP
+
     echo ""
     cat << EOF
 This node will be a worker and needs to connect to the LiteLLM hub.
-
 Please provide the IP address of your hub node.
 EOF
-    
+
     read -r -p "Enter hub node IP address: " HUB_LAN_IP
-    
+
     if [ -z "${HUB_LAN_IP}" ]; then
         log_error "Hub IP is required for worker nodes."
         prompt_hub_ip
+        return
     fi
-    
+
     log "Hub IP: ${HUB_LAN_IP}"
 }
 
-# Try to detect node from inventory
+# Try to detect node from inventory by IP
 try_detect_node() {
-    # Only try if NODE_IP is set
-    if [ -z "${NODE_IP:-}" ]; then
-        return 1
+    if [ -z "${NODE_IP}" ]; then
+        return 0
     fi
-    
+
     local node_id
-    node_id=$(yq eval '.nodes[] | select(.lan_ip == "'"${NODE_IP}"'") | .node_id' "${INVENTORY_FILE}" 2>/dev/null || echo "")
-    
+    node_id=$(yq eval ".nodes[] | select(.lan_ip == \"${NODE_IP}\") | .node_id" "${INVENTORY_FILE}" 2>/dev/null || true)
+
     if [ -n "${node_id}" ]; then
-        NODE_ID="${node_id}"
         local detected_role
-        detected_role=$(yq eval '.nodes[] | select(.node_id == "'"${NODE_ID}"'") | .role' "${INVENTORY_FILE}" 2>/dev/null || echo "")
-        
-        echo ""
-        log_info "Detected existing node in inventory: ${NODE_ID} (was: ${detected_role})"
+        detected_role=$(yq eval ".nodes[] | select(.node_id == \"${node_id}\") | .role" "${INVENTORY_FILE}" 2>/dev/null || true)
+
+        log_info "Found existing node in inventory: ${node_id} (was: ${detected_role})"
         read -r -p "Use this node ID? [Y/n]: " response
         case "${response}" in
-            [nN])
-                NODE_ID=""
-                ;;
+            [nN]) ;;
+            *) NODE_ID="${node_id}" ;;
         esac
     fi
-    
-    return 0
 }
 
 # Prompt for node ID
 prompt_node_id() {
-    if [ -n "${NODE_ID:-}" ]; then
+    if [ -n "${NODE_ID}" ]; then
         log "Using node ID: ${NODE_ID}"
         return 0
     fi
-    
-    echo ""
-    local existing_nodes
-    existing_nodes=$(yq eval '.nodes[].node_id' "${INVENTORY_FILE}" 2>/dev/null || echo "")
-    
-    if [ -n "${existing_nodes}" ]; then
-        cat << EOF
-Choose a node ID for this machine.
 
-Existing nodes in inventory:
-EOF
-        echo "${existing_nodes}" | while read -r node; do
-            echo "  - ${node}"
-        done
-        echo ""
-        read -r -p "Enter node ID (or press Enter for auto-generated): " NODE_ID
-    else
-        read -r -p "Enter node ID for this node (e.g., spark-01): " NODE_ID
-    fi
-    
+    echo ""
+    read -r -p "Enter node ID for this node (or press Enter to auto-generate from IP): " NODE_ID
+
     if [ -z "${NODE_ID}" ]; then
-        # Auto-generate
-        NODE_ID="spark-$(echo "${NODE_IP}" | tr '.' '-' | sed 's/-$//')"
+        NODE_ID="spark-$(echo "${NODE_IP}" | tr '.' '-')"
         log "Auto-generated node ID: ${NODE_ID}"
     fi
 }
 
 # Prompt for model recipe if worker
 prompt_model_recipe() {
-    if [ "${IS_WORKER}" != true ]; then
+    if ! is_worker; then
         return 0
     fi
-    
+
     echo ""
-    cat << EOF
-Select a model recipe for this worker.
-EOF
-    
-    local recipes
-    recipes=$(ls "${KIT_DIR}/recipes/" 2>/dev/null | grep -E '\.yaml$' | sed 's/\.yaml$//' || echo "")
-    
-    if [ -n "${recipes}" ]; then
+    local recipes=()
+    local recipe_file
+    for recipe_file in "${KIT_DIR}/recipes/"*.yaml; do
+        [ -e "${recipe_file}" ] || continue
+        recipes+=("$(basename "${recipe_file}" .yaml)")
+    done
+
+    if [ "${#recipes[@]}" -gt 0 ]; then
         echo "Available recipes:"
-        echo "${recipes}" | while read -r recipe; do
+        local recipe
+        for recipe in "${recipes[@]}"; do
             echo "  - ${recipe}"
         done
         echo ""
     fi
-    
+
     read -r -p "Enter model recipe name [default=qwen3.6-35b-a3b-nvfp4]: " MODEL_RECIPE
     MODEL_RECIPE="${MODEL_RECIPE:-qwen3.6-35b-a3b-nvfp4}"
-    
-    # Validate recipe exists (skip validation in non-interactive/non-sudo if file doesn't exist)
+
     if [ ! -f "${KIT_DIR}/recipes/${MODEL_RECIPE}.yaml" ]; then
-        log_warn "Recipe '${MODEL_RECIPE}' not found in recipes/ directory. Using default."
-        MODEL_RECIPE="qwen3.6-35b-a3b-nvfp4"
+        log_error "Recipe '${MODEL_RECIPE}' not found in recipes/ directory."
+        log_error "Add the recipe file first, then re-run. It will not be silently replaced."
+        exit 1
     fi
-    
+
     log "Model recipe: ${MODEL_RECIPE}"
+}
+
+# Read a field from a recipe file
+recipe_field() {
+    local recipe_name="$1"
+    local field="$2"
+    local default_value="$3"
+    local value
+    value=$(yq eval ".${field}" "${KIT_DIR}/recipes/${recipe_name}.yaml" 2>/dev/null || true)
+    if [ -z "${value}" ] || [ "${value}" = "null" ]; then
+        echo "${default_value}"
+    else
+        echo "${value}"
+    fi
+}
+
+# For workers: prefill from inventory entry if the node already exists
+sync_state_from_inventory() {
+    if [ -z "${NODE_ID}" ]; then
+        return 0
+    fi
+    if [ -z "${MODEL_RECIPE}" ] && is_worker; then
+        local inv_recipe
+        inv_recipe=$(yq eval ".nodes[] | select(.node_id == \"${NODE_ID}\") | .model_recipe" "${INVENTORY_FILE}" 2>/dev/null || true)
+        if [ -n "${inv_recipe}" ] && [ "${inv_recipe}" != "null" ]; then
+            MODEL_RECIPE="${inv_recipe}"
+            log "Using model recipe from inventory: ${MODEL_RECIPE}"
+        fi
+    fi
 }
 
 # Collect all user input
@@ -459,39 +458,28 @@ collect_user_input() {
     echo "  DGX Spark LLM Stack - Deployment Setup"
     echo "=========================================="
     echo ""
-    
+
     if [ "${NON_SUDO_MODE}" = true ]; then
         echo "  *** NON-SUDO MODE - SECURITY FEATURES DEGRADED ***"
         echo ""
     fi
-    
-    # Node IP
+
     prompt_node_ip
-    
-    # Try to detect existing node
     try_detect_node
-    
-    # Node role
     prompt_role
-    
-    # If worker, need hub IP
-    if [ "${IS_WORKER}" = true ]; then
+    sync_state_from_inventory
+
+    if is_worker; then
         prompt_hub_ip
     fi
-    
-    # Client subnets (only needed for hub)
-    if [ "${IS_HUB}" = true ]; then
+    if is_hub; then
         prompt_client_subnets
     fi
-    
-    # Node ID
     prompt_node_id
-    
-    # Model recipe (if worker)
-    if [ "${IS_WORKER}" = true ]; then
+    if is_worker; then
         prompt_model_recipe
     fi
-    
+
     echo ""
     echo "=========================================="
     echo "  Configuration Summary"
@@ -499,32 +487,19 @@ collect_user_input() {
     echo "  Node ID:       ${NODE_ID}"
     echo "  Node IP:       ${NODE_IP}"
     echo "  Role:          ${NODE_ROLE}"
-    if [ "${IS_HUB}" = true ]; then
-        echo "  Client Subnets:${CLIENT_SUBNETS[*]}"
+    if is_hub && [ "${#CLIENT_SUBNETS[@]}" -gt 0 ]; then
+        echo "  Client Subnets: ${CLIENT_SUBNETS[*]}"
     fi
-    if [ "${IS_WORKER}" = true ]; then
+    if is_worker; then
         echo "  Hub IP:        ${HUB_LAN_IP}"
-        echo "  Model Recipe: ${MODEL_RECIPE:-N/A}"
+        echo "  Model Recipe:  ${MODEL_RECIPE}"
     fi
     echo "=========================================="
     echo ""
-    
-    # Show mode-specific warnings
-    if [ "${NON_SUDO_MODE}" = true ]; then
-        echo "  *** NON-SUDO MODE WARNINGS ***"
-        echo "  - Containers will run as current user"
-        echo "  - No service user isolation"
-        echo "  - No firewall configuration"
-        echo "  - No Docker network creation"
-        echo ""
-    fi
-    
-    # Ask for confirmation
+
     read -r -p "Proceed with deployment? [y/N]: " response
     case "${response}" in
-        [yY][eE][sS]|[yY])
-            return 0
-            ;;
+        [yY][eE][sS]|[yY]) return 0 ;;
         *)
             log "Deployment cancelled."
             exit 0
@@ -532,33 +507,29 @@ collect_user_input() {
     esac
 }
 
+chown_svc() {
+    # Ownership helper: files are owned by the service user in sudo mode.
+    if [ "${USE_CURRENT_USER}" = false ]; then
+        chown "${SERVICE_USER}:${SERVICE_GROUP}" "$1"
+    fi
+}
+
 # Create service user (sudo only)
 create_service_user() {
     if [ "${USE_CURRENT_USER}" = true ]; then
-        log "Running in current user mode --no service user created"
         SVC_UID=$(id -u)
         SVC_GID=$(id -g)
         export SVC_UID SVC_GID
         return 0
     fi
-    
-    if [ "${NON_SUDO_MODE}" = true ]; then
-        log_warn "Not creating service user in non-sudo mode - using current user"
-        SVC_UID=$(id -u)
-        SVC_GID=$(id -g)
-        export SVC_UID SVC_GID
-        return 0
-    fi
-    
+
     log "Creating service user..."
-    
-    # Create group if it doesn't exist
+
     if ! getent group "${SERVICE_GROUP}" > /dev/null; then
         groupadd "${SERVICE_GROUP}"
         log "Created group: ${SERVICE_GROUP}"
     fi
-    
-    # Create user if it doesn't exist
+
     if ! id "${SERVICE_USER}" &> /dev/null; then
         useradd --system --no-create-home --shell /usr/sbin/nologin \
                 --gid "${SERVICE_GROUP}" "${SERVICE_USER}"
@@ -566,293 +537,424 @@ create_service_user() {
     else
         log "User ${SERVICE_USER} already exists."
     fi
-    
-    # Get UID and GID (use local variables, NOT readonly UID/GID)
+
     SVC_UID=$(id -u "${SERVICE_USER}")
     SVC_GID=$(id -g "${SERVICE_USER}")
     export SVC_UID SVC_GID
 }
 
-# Setup firewall
 setup_firewall() {
     if [ "${NON_SUDO_MODE}" = true ]; then
         log_warn "Skipping firewall configuration in non-sudo mode"
         log_warn "vLLM ports may be exposed to the entire LAN!"
         return 0
     fi
-    
+
     log "Configuring firewall..."
-    
-    # Default deny incoming
+
     ufw default deny incoming
-    
-    # Allow SSH (if we're not breaking existing access)
     ufw allow ssh
-    
-    if [ "${IS_HUB}" = true ]; then
-        # Hub: Allow LiteLLM port from client subnets
-        if [ ${#CLIENT_SUBNETS[@]} -gt 0 ]; then
-            for subnet in "${CLIENT_SUBNETS[@]}"; do
-                ufw allow from "${subnet}" to any port "${LITELLM_PORT}" proto tcp comment 'LiteLLM Hub Access'
-                log "Allowed LiteLLM port ${LITELLM_PORT} from ${subnet}"
-            done
-        fi
-        
-        # Hub: Allow worker connections to self (if hub+worker)
-        if [ "${IS_WORKER}" = true ]; then
-            ufw allow from "${NODE_IP}" to any port "${VLLM_PORT}" proto tcp comment 'Self Worker Access'
-        fi
+
+    if is_hub && [ "${#CLIENT_SUBNETS[@]}" -gt 0 ]; then
+        local subnet
+        for subnet in "${CLIENT_SUBNETS[@]}"; do
+            ufw allow from "${subnet}" to any port "${LITELLM_PORT}" proto tcp comment 'LiteLLM Hub Access'
+            log "Allowed LiteLLM port ${LITELLM_PORT} from ${subnet}"
+        done
     fi
-    
-    if [ "${IS_WORKER}" = true ]; then
-        # Worker: Allow vLLM port from hub only
+
+    if is_worker; then
+        # Worker (or hub+worker): vLLM port reachable from the hub IP only.
         ufw allow from "${HUB_LAN_IP}" to any port "${VLLM_PORT}" proto tcp comment 'Worker Hub Access'
         log "Allowed vLLM port ${VLLM_PORT} from hub at ${HUB_LAN_IP}"
     fi
-    
-    # Allow outgoing traffic (fixes kit-1's bug)
+
     ufw default allow outgoing
-    
-    # Enable firewall
     ufw --force enable
     log "Firewall configured and enabled."
 }
 
-# Create Docker network
 create_network() {
+    if [ "${SYNC_KEYS_ONLY}" = true ]; then
+        return 0
+    fi
+
     log "Creating Docker network..."
-    
+
     if [ "${NON_SUDO_MODE}" = true ]; then
-        log_warn "In non-sudo mode: checking if network exists..."
         if ! docker network inspect "${DOCKER_NETWORK}" &> /dev/null; then
             log_error "Docker network ${DOCKER_NETWORK} does not exist and cannot be created without root."
-            log_error "Please create the network manually with: sudo docker network create ${DOCKER_NETWORK}"
+            log_error "Please create it manually: sudo docker network create ${DOCKER_NETWORK}"
             exit 1
         fi
         log "Using existing Docker network: ${DOCKER_NETWORK}"
         return 0
     fi
-    
+
     if ! docker network inspect "${DOCKER_NETWORK}" &> /dev/null; then
-        docker network create "${DOCKER_NETWORK}" 2>&1
+        docker network create "${DOCKER_NETWORK}" > /dev/null
         log "Created Docker network: ${DOCKER_NETWORK}"
     else
         log "Docker network ${DOCKER_NETWORK} already exists."
     fi
 }
 
-# Generate secrets
+# Generate secrets.
+# NOTE: DATABASE_URL is constructed in exactly one place, here, with the
+# compose service hostname `postgres` (the container resolves it on the
+# bridge network). Never reconstruct it elsewhere.
 generate_secrets() {
+    if [ "${SYNC_KEYS_ONLY}" = true ]; then
+        return 0
+    fi
+
     log "Generating secrets..."
-    
     touch_secrets_dir
-    
-    if [ "${IS_HUB}" = true ]; then
-        # Hub secrets: DB password, LiteLLM master key
+
+    if is_hub; then
         local DB_PASSWORD_FILE="${SECRETS_DIR}/db_password.txt"
         local LITELLM_MASTER_KEY_FILE="${SECRETS_DIR}/litellm_master_key.txt"
-        
+
         if [ ! -f "${DB_PASSWORD_FILE}" ]; then
-            openssl rand -base64 32 > "${DB_PASSWORD_FILE}"
-            chmod 600 "${DB_PASSWORD_FILE}"
-            if [ "${USE_CURRENT_USER}" = false ]; then
-                chown "${SERVICE_USER}:${SERVICE_GROUP}" "${DB_PASSWORD_FILE}"
-            fi
+            (umask 077 && openssl rand -base64 32 > "${DB_PASSWORD_FILE}")
+            chown_svc "${DB_PASSWORD_FILE}"
             log "Generated DB password."
         fi
-        
+
         if [ ! -f "${LITELLM_MASTER_KEY_FILE}" ]; then
-            # LiteLLM requires sk- prefix for master key
-            echo "sk-$(openssl rand -hex 31)" > "${LITELLM_MASTER_KEY_FILE}"
-            chmod 600 "${LITELLM_MASTER_KEY_FILE}"
-            if [ "${USE_CURRENT_USER}" = false ]; then
-                chown "${SERVICE_USER}:${SERVICE_GROUP}" "${LITELLM_MASTER_KEY_FILE}"
-            fi
+            # LiteLLM requires the sk- prefix for the master key
+            (umask 077 && echo "sk-$(openssl rand -hex 31)" > "${LITELLM_MASTER_KEY_FILE}")
+            chown_svc "${LITELLM_MASTER_KEY_FILE}"
             log "Generated LiteLLM master key with sk- prefix."
         fi
-        
-        # Generate database URL
-        local DB_PASSWORD=$(cat "${DB_PASSWORD_FILE}")
-        DATABASE_URL="postgresql://litellm:${DB_PASSWORD}@localhost:${POSTGRES_PORT}/litellm"
-        export DATABASE_URL
-    fi
-    
-    # Worker secrets: VLLM API key
-    if [ "${IS_WORKER}" = true ]; then
-        local VLLM_API_KEY_FILE="${SECRETS_DIR}/vllm_api_key.txt"
-        
-        if [ ! -f "${VLLM_API_KEY_FILE}" ]; then
-            openssl rand -hex 32 > "${VLLM_API_KEY_FILE}"
-            chmod 600 "${VLLM_API_KEY_FILE}"
-            if [ "${USE_CURRENT_USER}" = false ]; then
-                chown "${SERVICE_USER}:${SERVICE_GROUP}" "${VLLM_API_KEY_FILE}"
+
+        local vllm_self_key=""
+        if is_worker; then
+            vllm_self_key="$(cat "${SECRETS_DIR}/vllm_api_key.txt")"
+        fi
+
+        # hub.env: single env source for the compose stack (substitution + env_file)
+        local env_file="${SECRETS_DIR}/hub.env"
+        {
+            echo "DB_PASSWORD=$(cat "${DB_PASSWORD_FILE}")"
+            echo "LITELLM_MASTER_KEY=$(cat "${LITELLM_MASTER_KEY_FILE}")"
+            echo "DATABASE_URL=postgresql://litellm:$(cat "${DB_PASSWORD_FILE}")@postgres:${POSTGRES_PORT}/litellm"
+            echo "NODE_IP=${NODE_IP}"
+            echo "LITELLM_IMAGE=${LITELLM_IMAGE}"
+            echo "POSTGRES_IMAGE=${POSTGRES_IMAGE}"
+            echo "GENERATED_DIR=${GENERATED_DIR}"
+            echo "SECRETS_DIR=${SECRETS_DIR}"
+            # Per-worker vLLM API keys, one variable per route. This node's own
+            # key (hub+worker) plus every remote worker key under
+            # secrets/worker_keys/<node>.txt (see sync_worker_keys).
+            if [ -n "${vllm_self_key}" ]; then
+                echo "VLLM_KEY_$(sanitize_node_id "${NODE_ID}")=${vllm_self_key}"
             fi
+            local key_file
+            for key_file in "${SECRETS_DIR}/worker_keys"/*.txt; do
+                if [ -e "${key_file}" ]; then
+                    local wid
+                    wid="$(basename "${key_file}" .txt)"
+                    echo "VLLM_KEY_$(sanitize_node_id "${wid}")=$(cat "${key_file}")"
+                fi
+            done
+        } > "${env_file}"
+        chmod 600 "${env_file}"
+        chown_svc "${env_file}"
+    fi
+
+    if is_worker; then
+        local VLLM_API_KEY_FILE="${SECRETS_DIR}/vllm_api_key.txt"
+        if [ ! -f "${VLLM_API_KEY_FILE}" ]; then
+            (umask 077 && openssl rand -hex 32 > "${VLLM_API_KEY_FILE}")
+            chown_svc "${VLLM_API_KEY_FILE}"
             log "Generated VLLM API key."
         fi
-        
-        VLLM_API_KEY=$(cat "${VLLM_API_KEY_FILE}")
-        export VLLM_API_KEY
     fi
 }
 
-# Generate LiteLLM config
-generate_litellm_config() {
-    if [ "${IS_HUB}" != true ]; then
+# Node IDs may contain '-' or '.'; sanitize for use in env var names.
+sanitize_node_id() {
+    echo "$1" | tr '[:lower:].-' '[:upper:]__'
+}
+
+# Fetch each remote worker's vLLM API key over scp and register it on the hub.
+# Run on the hub: sudo ./infrastructure/deploy.sh --sync-keys
+sync_worker_keys() {
+    mkdir -p "${SECRETS_DIR}/worker_keys"
+    chmod 700 "${SECRETS_DIR}/worker_keys" 2>/dev/null || true
+
+    local workers
+    workers=$(yq eval ".nodes[] | select(.role == \"worker\") | \"\(.node_id) \(.lan_ip)\"" "${INVENTORY_FILE}" 2>/dev/null || true)
+
+    if [ -z "${workers}" ]; then
+        log_warn "No worker nodes in the inventory yet. Deploy workers first, then re-run --sync-keys."
         return 0
     fi
-    
+
+    local entry
+    while read -r entry; do
+        [ -z "${entry}" ] && continue
+        local wid wip
+        wid="$(echo "${entry}" | awk '{print $1}')"
+        wip="$(echo "${entry}" | awk '{print $2}')"
+
+        local existing="${SECRETS_DIR}/worker_keys/${wid}.txt"
+        if [ -s "${existing}" ]; then
+            read -r -p "Worker ${wid} (${wip}) key already present. Re-fetch? [y/N]: " resp
+            case "${resp}" in
+                [yY]|[yY][eE][sS]) ;;
+                *) continue ;;
+            esac
+        fi
+
+        read -r -p "Fetch API key for ${wid}: ssh target [${wip}] (Enter=default, 'skip' to skip): " target
+        target="${target:-${wip}}"
+        [ "${target}" = "skip" ] && continue
+
+        read -r -p "Path to spark-kit-3 on ${wid} [~/DGX-Spark-Insanity/spark-kits/spark-kit-3]: " remote_dir
+        remote_dir="${remote_dir:-$HOME/DGX-Spark-Insanity/spark-kits/spark-kit-3}"
+
+        # shellcheck disable=SC2029
+        if scp -q "${target}:${remote_dir}/secrets/vllm_api_key.txt" "${existing}"; then
+            chmod 600 "${existing}"
+            chown_svc "${existing}"
+            log "Stored API key for ${wid}."
+        else
+            log_warn "Could not fetch key for ${wid} (scp failed). Routing to it will fail until the key is present."
+        fi
+    done <<< "${workers}"
+}
+
+# Generate LiteLLM config from the inventory.
+# Every worker endpoint gets its own route with its own api_key env var;
+# replicas sharing a model name load-balance via the router.
+generate_litellm_config() {
+    if ! is_hub; then
+        return 0
+    fi
+
     log "Generating LiteLLM configuration..."
-    
+
     local config_file="${GENERATED_DIR}/litellm-config.yaml"
-    
+
     cat > "${config_file}" << 'LITELLM_CONFIG_HEADER'
 model_list:
 LITELLM_CONFIG_HEADER
-    
-    # For this node (hub+worker) add self as worker
-    if [ "${IS_WORKER}" = true ]; then
+
+    # This node's own worker (hub+worker role)
+    if is_worker; then
+        local hf served
+        hf=$(recipe_field "${MODEL_RECIPE}" "model_name" "nvidia/Qwen3.6-35B-A3B-NVFP4")
+        served=$(recipe_field "${MODEL_RECIPE}" "served_model_name" "${MODEL_RECIPE}")
         cat >> "${config_file}" << LITELLM_CONFIG_ENTRY
-  - model_name: ${MODEL_RECIPE}
+  - model_name: ${served}
     litellm_params:
-      model: openai/nvidia/Qwen3.6-35B-A3B-NVFP4
+      model: openai/${hf}
       api_base: http://host.docker.internal:${VLLM_PORT}/v1
-      api_key: os.environ/VLLM_API_KEY
-      reasoning_effort: medium
-      max_tokens: 8192
+      api_key: os.environ/VLLM_KEY_$(sanitize_node_id "${NODE_ID}")
 LITELLM_CONFIG_ENTRY
     fi
-    
-    # Add worker entries from inventory that match role
-    local inventory_workers
-    inventory_workers=$(yq eval '.nodes[] | select(.role | contains("worker")) | select(.lan_ip != "'"${NODE_IP}"'")' "${INVENTORY_FILE}" 2>/dev/null || echo "")
-    
-    while IFS= read -r line; do
-        if [ -z "$line" ]; then
-            continue
+
+    # Remote workers from the inventory: one route per endpoint, keyed by
+    # that worker's own API key; model name/flags come from its recipe.
+    local workers
+    workers=$(yq eval ".nodes[] | select(.role == \"worker\") | \"\(.node_id)|\(.lan_ip)|\(.model_recipe)\"" "${INVENTORY_FILE}" 2>/dev/null || true)
+
+    local entry
+    while IFS= read -r entry; do
+        [ -z "${entry}" ] && continue
+        local wid wip wrecipe hf served
+        wid="$(echo "${entry}" | cut -d'|' -f1)"
+        wip="$(echo "${entry}" | cut -d'|' -f2)"
+        wrecipe="$(echo "${entry}" | cut -d'|' -f3)"
+
+        [ -f "${KIT_DIR}/recipes/${wrecipe}.yaml" ] || wrecipe="qwen3.6-35b-a3b-nvfp4"
+        hf=$(recipe_field "${wrecipe}" "model_name" "nvidia/Qwen3.6-35B-A3B-NVFP4")
+        served=$(recipe_field "${wrecipe}" "served_model_name" "${wrecipe}")
+
+        local key_var
+        key_var="os.environ/VLLM_KEY_$(sanitize_node_id "${wid}")"
+        local key_file="${SECRETS_DIR}/worker_keys/${wid}.txt"
+        if [ ! -s "${key_file}" ] && [ "${wid}" != "${NODE_ID}" ]; then
+            log_warn "No API key on file for worker ${wid}; its route will fail auth until you run: sudo $0 --sync-keys"
         fi
-        
-        local worker_ip worker_model
-        worker_ip=$(echo "$line" | yq eval '.lan_ip' 2>/dev/null || echo "")
-        worker_model=$(echo "$line" | yq eval '.model_recipe' 2>/dev/null || echo "qwen3.6-35b-a3b-nvfp4")
-        
-        if [ -n "${worker_ip}" ]; then
-            cat >> "${config_file}" << LITELLM_CONFIG_ENTRY
-  - model_name: ${worker_model}
+
+        cat >> "${config_file}" << LITELLM_CONFIG_ENTRY
+  - model_name: ${served}
     litellm_params:
-      model: openai/nvidia/Qwen3.6-35B-A3B-NVFP4
-      api_base: http://${worker_ip}:${VLLM_PORT}/v1
-      api_key: os.environ/VLLM_API_KEY
-      reasoning_effort: medium
-      max_tokens: 8192
+      model: openai/${hf}
+      api_base: http://${wip}:${VLLM_PORT}/v1
+      api_key: ${key_var}
 LITELLM_CONFIG_ENTRY
-        fi
-    done <<< "${inventory_workers}"
-    
-    # Add general settings
+    done <<< "${workers}"
+
     cat >> "${config_file}" << 'LITELLM_CONFIG_FOOTER'
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   disable_env_credential_login: true
 LITELLM_CONFIG_FOOTER
-    
+
     log "Generated LiteLLM config: ${config_file}"
     chmod 640 "${config_file}"
-    if [ "${USE_CURRENT_USER}" = false ]; then
-        chown "${SERVICE_USER}:${SERVICE_GROUP}" "${config_file}"
+    chown_svc "${config_file}"
+}
+
+# Record this node in the inventory so the file stays the single source of truth.
+update_inventory() {
+    log "Recording node ${NODE_ID} in inventory..."
+    export NODE_ID NODE_ROLE NODE_IP MODEL_RECIPE
+    yq eval -i 'del(.nodes[] | select(.node_id == env(NODE_ID) or .lan_ip == env(NODE_IP)))' "${INVENTORY_FILE}"
+    if is_worker; then
+        yq eval -i '.nodes += [{"node_id": env(NODE_ID), "role": env(NODE_ROLE), "lan_ip": env(NODE_IP), "model_recipe": env(MODEL_RECIPE)}]' "${INVENTORY_FILE}"
+    else
+        yq eval -i '.nodes += [{"node_id": env(NODE_ID), "role": env(NODE_ROLE), "lan_ip": env(NODE_IP), "model_recipe": null}]' "${INVENTORY_FILE}"
+    fi
+    unset NODE_ID NODE_ROLE NODE_IP MODEL_RECIPE
+}
+
+# Optional NFS model cache (spec: optional, root_squash, subnet-restricted).
+setup_nfs() {
+    if [ "${SYNC_KEYS_ONLY}" = true ]; then
+        return 0
+    fi
+
+    local enabled export_path
+    enabled=$(yq eval '.lab.nfs.enabled // false' "${INVENTORY_FILE}")
+    if [ "${enabled}" != "true" ]; then
+        log "NFS model cache disabled (inventory lab.nfs.enabled != true). Skipping."
+        return 0
+    fi
+
+    export_path=$(yq eval '.lab.nfs.export_path // "/mnt/shared-models"' "${INVENTORY_FILE}")
+
+    mkdir -p "${export_path}"
+
+    if is_hub; then
+        log "Configuring NFS export ${export_path} (root_squash, subnet-restricted)..."
+        if ! command -v exportfs &> /dev/null; then
+            log_warn "NFS server tools not installed (nfs-kernel-server). Install and re-run to share the cache."
+            return 0
+        fi
+        local subnet
+        {
+            echo "# Managed by spark-kit-3 deploy.sh"
+            for subnet in "${CLIENT_SUBNETS[@]}"; do
+                echo "${export_path} ${subnet}(rw,sync,no_subtree_check,root_squash)"
+            done
+        } > /etc/exports.d/spark-kit-3.exports 2>/dev/null || {
+            mkdir -p /etc/exports.d
+            {
+                echo "# Managed by spark-kit-3 deploy.sh"
+                for subnet in "${CLIENT_SUBNETS[@]}"; do
+                    echo "${export_path} ${subnet}(rw,sync,no_subtree_check,root_squash)"
+                done
+            } > /etc/exports.d/spark-kit-3.exports
+        }
+        exportfs -ra || log_warn "exportfs -ra failed; check /etc/exports.d/spark-kit-3.exports"
+        if [ "${#CLIENT_SUBNETS[@]}" -gt 0 ]; then
+            ufw allow from "${CLIENT_SUBNETS[0]}" to any port 2049 proto tcp comment 'NFS model cache'
+        fi
+        log "NFS export configured."
+    fi
+
+    if is_worker && [ "${HUB_LAN_IP}" != "${NODE_IP}" ]; then
+        log "Attempting read-only NFS mount from hub (${HUB_LAN_IP})..."
+        if mountpoint -q "${export_path}" 2>/dev/null; then
+            log "Already mounted."
+        elif mount -t nfs -o ro,hard,timeo=50 "${HUB_LAN_IP}:${export_path}" "${export_path}" 2>/dev/null; then
+            log "NFS cache mounted read-only at ${export_path}."
+        else
+            log_warn "NFS mount failed. Falling back to independent model downloads on this node."
+        fi
     fi
 }
 
-# Deploy hub
 deploy_hub() {
-    if [ "${IS_HUB}" != true ]; then
+    if ! is_hub; then
         return 0
     fi
-    
+
     log "Deploying Hub..."
-    
+
     local docker_compose_file="${SCRIPT_DIR}/docker-compose.hub.yml"
     local env_file="${SECRETS_DIR}/hub.env"
-    
-    # Create hub.env
-    cat > "${env_file}" << EOF
-DB_PASSWORD=$(cat "${SECRETS_DIR}/db_password.txt")
-LITELLM_MASTER_KEY=$(cat "${SECRETS_DIR}/litellm_master_key.txt")
-DATABASE_URL=${DATABASE_URL}
-NODE_IP=${NODE_IP}
-SVC_UID=${SVC_UID}
-SVC_GID=${SVC_GID}
-EOF
-    chmod 600 "${env_file}"
-    if [ "${USE_CURRENT_USER}" = false ]; then
-        chown "${SERVICE_USER}:${SERVICE_GROUP}" "${env_file}"
-    fi
-    
+
     log "Starting Hub services via Docker Compose..."
     cd "${SCRIPT_DIR}"
-    
+
     docker compose -f "${docker_compose_file}" \
         --env-file "${env_file}" \
         up -d --remove-orphans
-    
+
     log "Hub deployed successfully."
     log "LiteLLM accessible at http://${NODE_IP}:${LITELLM_PORT}/v1"
 }
 
-# Deploy worker
 deploy_worker() {
-    if [ "${IS_WORKER}" != true ]; then
+    if ! is_worker; then
         return 0
     fi
-    
+
     log "Deploying Worker..."
-    
-    # Load recipe
-    local recipe_file="${KIT_DIR}/recipes/${MODEL_RECIPE}.yaml"
+
     local hf_model_name served_model_name
-    hf_model_name=$(yq eval '.model_name' "${recipe_file}" 2>/dev/null || echo "nvidia/Qwen3.6-35B-A3B-NVFP4")
-    served_model_name=$(yq eval '.served_model_name' "${recipe_file}" 2>/dev/null || echo "${MODEL_RECIPE}")
-    local max_model_len=$(yq eval '.max_model_len' "${recipe_file}" 2>/dev/null || echo "262144")
-    local gpu_mem_util=$(yq eval '.gpu_memory_utilization' "${recipe_file}" 2>/dev/null || echo "0.8")
-    local max_num_seqs=$(yq eval '.max_num_seqs' "${recipe_file}" 2>/dev/null || echo "15")
-    local tool_call_parser=$(yq eval '.tool_call_parser' "${recipe_file}" 2>/dev/null || echo "qwen3_xml")
-    local reasoning_parser=$(yq eval '.reasoning_parser' "${recipe_file}" 2>/dev/null || echo "qwen3")
-    local auto_tool_choice=$(yq eval '.enable_auto_tool_choice' "${recipe_file}" 2>/dev/null || echo "true")
-    local trust_remote=$(yq eval '.trust_remote_code' "${recipe_file}" 2>/dev/null || echo "true")
-    
-    # Create worker environment file
+    hf_model_name=$(recipe_field "${MODEL_RECIPE}" "model_name" "nvidia/Qwen3.6-35B-A3B-NVFP4")
+    served_model_name=$(recipe_field "${MODEL_RECIPE}" "served_model_name" "${MODEL_RECIPE}")
+    local max_model_len gpu_mem_util max_num_seqs tool_call_parser reasoning_parser
+    max_model_len=$(recipe_field "${MODEL_RECIPE}" "max_model_len" "262144")
+    gpu_mem_util=$(recipe_field "${MODEL_RECIPE}" "gpu_memory_utilization" "0.8")
+    max_num_seqs=$(recipe_field "${MODEL_RECIPE}" "max_num_seqs" "15")
+    tool_call_parser=$(recipe_field "${MODEL_RECIPE}" "tool_call_parser" "qwen3_xml")
+    reasoning_parser=$(recipe_field "${MODEL_RECIPE}" "reasoning_parser" "qwen3")
+    local auto_tool_choice trust_remote shm_size
+    auto_tool_choice=$(recipe_field "${MODEL_RECIPE}" "enable_auto_tool_choice" "true")
+    trust_remote=$(recipe_field "${MODEL_RECIPE}" "trust_remote_code" "true")
+    shm_size=$(recipe_field "${MODEL_RECIPE}" "shm_size" "2g")
+
     local worker_config_dir="${GENERATED_DIR}/workers"
     mkdir -p "${worker_config_dir}"
     local worker_env_file="${worker_config_dir}/${NODE_ID}.env"
-    
-    cat > "${worker_env_file}" << EOF
-VLLM_API_KEY=$(cat "${SECRETS_DIR}/vllm_api_key.txt")
-NODE_ID=${NODE_ID}
-NODE_IP=${NODE_IP}
-SVC_UID=${SVC_UID}
-SVC_GID=${SVC_GID}
-HUB_IP=${HUB_LAN_IP}
-EOF
+
+    {
+        echo "VLLM_API_KEY=$(cat "${SECRETS_DIR}/vllm_api_key.txt")"
+        echo "NODE_ID=${NODE_ID}"
+        echo "NODE_IP=${NODE_IP}"
+        echo "SVC_UID=${SVC_UID}"
+        echo "SVC_GID=${SVC_GID}"
+        echo "HUB_IP=${HUB_LAN_IP}"
+        if [ -d "/mnt/shared-models" ] && mountpoint -q "/mnt/shared-models" 2>/dev/null; then
+            echo "HF_HUB_CACHE=/mnt/shared-models"
+        fi
+    } > "${worker_env_file}"
     chmod 600 "${worker_env_file}"
-    if [ "${USE_CURRENT_USER}" = false ]; then
-        chown "${SERVICE_USER}:${SERVICE_GROUP}" "${worker_env_file}"
-    fi
-    
+    chown_svc "${worker_env_file}"
+
     local container_name="vllm-${NODE_ID}"
-    
-    log "Starting vLLM container for model: ${served_model_name}"
-    
-    # Determine port binding
-    local port_flags=""
-    if [ "${NON_SUDO_MODE}" = true ]; then
-        # Non-sudo: can only bind to ports > 1024 or use 0.0.0.0 with appropriate permissions
-        log_warn "In non-sudo mode: binding to 0.0.0.0:8000 (may require port > 1024)"
-        port_flags="--publish 0.0.0.0:${VLLM_PORT}:${VLLM_PORT}"
-    else
-        # Sudo: bind to node IP only
-        port_flags="--publish ${NODE_IP}:${VLLM_PORT}:${VLLM_PORT}"
+
+    # Remove a stale container from a previous run so the new flags apply
+    if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+        log "Removing existing container ${container_name}..."
+        docker rm -f "${container_name}" > /dev/null
     fi
-    
+
+    log "Starting vLLM container for model: ${served_model_name}"
+
+    local port_flags=()
+    if [ "${NON_SUDO_MODE}" = true ]; then
+        log_warn "In non-sudo mode: binding to 0.0.0.0:${VLLM_PORT} (NOT restricted to the hub)"
+        port_flags=(--publish "0.0.0.0:${VLLM_PORT}:${VLLM_PORT}")
+    else
+        port_flags=(--publish "${NODE_IP}:${VLLM_PORT}:${VLLM_PORT}")
+    fi
+
+    local extra_flags=()
+    [ "${auto_tool_choice}" = "true" ] && extra_flags+=("--enable-auto-tool-choice")
+    [ "${trust_remote}" = "true" ] && extra_flags+=("--trust-remote-code")
+
+    # vLLM needs shared memory for activation/compile buffers; size comes from
+    # the recipe (shm_size). This is an ipc/disc setting, not host networking.
     docker run -d \
         --name "${container_name}" \
         --network "${DOCKER_NETWORK}" \
@@ -861,13 +963,16 @@ EOF
         --env-file "${worker_env_file}" \
         --gpus all \
         --restart unless-stopped \
-        ${port_flags} \
-        --health-cmd "curl -f http://localhost:${VLLM_PORT}/v1/models || exit 1" \
+        --shm-size "${shm_size}" \
+        "${port_flags[@]}" \
+        --health-cmd "curl -f http://localhost:${VLLM_PORT}/health || exit 1" \
         --health-interval 30s \
         --health-timeout 10s \
-        --health-retries 3 \
+        --health-retries 5 \
+        --health-start-period 180s \
         "${VLLM_IMAGE}" \
-        "${hf_model_name}" \
+        --model "${hf_model_name}" \
+        --served-model-name "${served_model_name}" \
         --host 0.0.0.0 \
         --port "${VLLM_PORT}" \
         --max-model-len "${max_model_len}" \
@@ -875,9 +980,8 @@ EOF
         --max-num-seqs "${max_num_seqs}" \
         --reasoning-parser "${reasoning_parser}" \
         --tool-call-parser "${tool_call_parser}" \
-        $( [ "${auto_tool_choice}" = "true" ] && echo "--enable-auto-tool-choice" ) \
-        $( [ "${trust_remote}" = "true" ] && echo "--trust-remote-code" )
-    
+        "${extra_flags[@]+"${extra_flags[@]}"}"
+
     log "Worker deployed successfully."
     log "vLLM serving ${served_model_name} at http://${NODE_IP}:${VLLM_PORT}/v1"
 }
@@ -888,34 +992,61 @@ main() {
     validate_mode
     check_prerequisites
     touch_generated_dir
-    
-    # Collect all user input interactively
+
+    if [ "${SYNC_KEYS_ONLY}" = true ]; then
+        if [ ! -f "${SECRETS_DIR}/hub.env" ]; then
+            log_error "No hub.env found; run a full deploy on this node first."
+            exit 1
+        fi
+        touch_secrets_dir
+        sync_worker_keys
+        generate_litellm_config
+        # Re-apply the stack with regenerated config; hub.env retains NODE_IP
+        # and the new VLLM_KEY_* entries, so no re-prompting is needed.
+        docker compose -f "${SCRIPT_DIR}/docker-compose.hub.yml" \
+            --env-file "${SECRETS_DIR}/hub.env" \
+            up -d --remove-orphans
+        log "Worker keys synced and LiteLLM restarted."
+        return 0
+    fi
+
     collect_user_input
-    
-    # Deploy based on role
+
     create_service_user
     create_network
     setup_firewall
     generate_secrets
-    
-    if [ "${IS_HUB}" = true ]; then
+
+    if is_hub; then
+        sync_worker_keys
         generate_litellm_config
-        deploy_hub
     fi
-    
-    if [ "${IS_WORKER}" = true ]; then
+
+    if is_worker; then
         deploy_worker
+        # The hub needs this node's key to authenticate; prompt to push it now.
+        echo ""
+        log "Next step on the HUB node, run: sudo ./infrastructure/deploy.sh --sync-keys"
+        log "so it can fetch this node's API key and route to it."
     fi
-    
+
+    if is_hub; then
+        deploy_hub
+        # Persist node config after services are up
+        update_inventory
+    fi
+
+    setup_nfs
+
     log ""
     log "=== Deployment Complete ==="
-    if [ "${IS_HUB}" = true ]; then
+    if is_hub; then
         log "LiteLLM endpoint: http://${NODE_IP}:${LITELLM_PORT}/v1"
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - ensure port ${LITELLM_PORT} is secured manually"
         fi
     fi
-    if [ "${IS_WORKER}" = true ]; then
+    if is_worker; then
         log "vLLM worker active on port: ${VLLM_PORT}"
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - vLLM may be exposed to LAN"
@@ -926,4 +1057,7 @@ main() {
     log "To rollback, run: sudo ./scripts/rollback.sh"
 }
 
-main "$@"
+# Allow sourcing for tests without executing
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

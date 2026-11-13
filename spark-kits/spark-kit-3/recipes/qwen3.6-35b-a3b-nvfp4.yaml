@@ -31,6 +31,11 @@ gpu_memory_utilization: 0.8
 # Increased from default 6 to 15 for better throughput with agentic workloads
 max_num_seqs: 15
 
+# Shared memory for the vLLM container (--shm-size), in bytes or docker size
+# notation. vLLM uses /dev/shm for activation buffers; raise if you see
+# shm allocation errors under load.
+shm_size: "16g"
+
 # Enable automatic tool choice
 # Allows vLLM to automatically select appropriate tools
 enable_auto_tool_choice: true
