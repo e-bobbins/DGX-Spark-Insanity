@@ -81,9 +81,12 @@ For testing without root access (security degraded):
 **⚠️ WARNING: Non-sudo mode is for testing only. In production, always use sudo mode for full security.**
 
 # Verify deployment:
+```bash
 ./scripts/verify.sh
+```
 
 # Rollback (per-node):
+```bash
 sudo ./scripts/rollback.sh --yes
 ```
 
