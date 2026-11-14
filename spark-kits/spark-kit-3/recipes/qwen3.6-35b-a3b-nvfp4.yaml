@@ -7,11 +7,12 @@
 model_name: "nvidia/Qwen3.6-35B-A3B-NVFP4"
 
 # vLLM NGC image this model is validated against.
-# Omit to use the kit default. NGC tags are YY.MM-py3; those built on CUDA
-# 13.4+ (e.g. 26.10-py3) need the R615 driver branch (see README
-# "Driver baseline"). NOTE: do NOT use upstream vllm/vllm-openai:* stable
-# images on GB10 (no SM121 support); use NGC tags.
-vllm_image: "nvcr.io/nvidia/vllm:26.04-py3"
+# Omit to use the kit default. NGC tags are YY.MM-py3; image driver floors
+# are set by the image build: 26.04-py3 needs driver 595.58, 26.10-py3
+# needs 615.71 (both measured). Community-validated on GB10 with the 580.x
+# driver: 26.01-py3, 25.12.post1-py3. NOTE: do NOT use upstream
+# vllm/vllm-openai:* stable images on GB10 (no SM121 support).
+vllm_image: "nvcr.io/nvidia/vllm:26.01-py3"
 
 # Minimum host NVIDIA driver for the pinned image (nvidia-smi version).
 # 580.65 = floor of the R580 branch; deployment fails fast with a clear

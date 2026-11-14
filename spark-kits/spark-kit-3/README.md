@@ -216,10 +216,15 @@ mount fails, each worker downloads independently and deployment continues.
 Pinned in one place at the top of `infrastructure/deploy.sh` and passed to
 compose through the env file:
 
-- vLLM: `nvcr.io/nvidia/vllm:26.04-py3` (NGC tags follow `YY.MM-py3` and
-  include linux/arm64 builds; this is what makes it GB10-capable). Also
-  community-validated on GB10 with the 580 driver: `26.02+` and
-  `25.12.post1-py3`. Do **not** use upstream `vllm/vllm-openai:*` stable
+- vLLM: `nvcr.io/nvidia/vllm:26.01-py3` (NGC tags follow `YY.MM-py3` and
+  include linux/arm64 builds; this is what makes it GB10-capable). NGC
+  image driver floors are set by the image build, not just the CUDA
+  family: measured on real Sparks, `26.04-py3` demands 595.58 and
+  `26.10-py3` demands 615.71 — both crash-loop on the stock 580 driver.
+  Community-validated on GB10 with 580.x: `26.01-py3`, `25.12.post1-py3`.
+  The deployment probes the pinned image against the actual driver after
+  pull and fails with the exact required version, so a wrong tag can never
+  crash-loop silently. Do **not** use upstream `vllm/vllm-openai:*` stable
   images on GB10 — they lack SM121 support; NGC tags only (or the
   `vllm/vllm-openai:cu130-nightly` track if you know you need it).
 - LiteLLM: `ghcr.io/berriai/litellm:v1.83.7-stable`

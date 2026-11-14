@@ -48,13 +48,15 @@ DOCKER_NETWORK="spark-kit-llm-net"
 # - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
 #
 # Driver baseline: DGX Spark (GB10) ships the 580.x series (R580 branch,
-# minimum 580.65, first branch of CUDA 13). NGC vLLM images built on CUDA
-# 13.4+ (e.g. 26.10-py3) need the R615 branch and hard-fail on 580.x when
-# CUDA forward compatibility cannot initialize — a crash-loop whose first
-# log lines read "compatibility mode is UNAVAILABLE". The kit default is
-# therefore pinned to 26.04-py3 (vLLM 0.19.0, CUDA 13.2.1), the tag
-# community-validated on GB10 with the 580 driver.
-VLLM_IMAGE_DEFAULT="nvcr.io/nvidia/vllm:26.04-py3"
+# minimum 580.65, first branch of CUDA 13). NGC vLLM image floors are set by
+# the image build, not just the CUDA family: empirically 26.04-py3 demands
+# 595.58 and 26.10-py3 demands 615.71, so both crash-loop on 580.x with
+# "compatibility mode is UNAVAILABLE" before the GPU is touched. The kit
+# default is therefore pinned to 26.01-py3, community-validated on GB10 with
+# the 580 driver (NVIDIA's own Spark recipes also use the 25.12/26.02 line).
+# deploy_worker probes every image against the real driver after pull —
+# never trust a recipe's claimed floor over the probe.
+VLLM_IMAGE_DEFAULT="nvcr.io/nvidia/vllm:26.01-py3"
 # Runtime env copies (checked/set per-node; recipes may override the image).
 VLLM_IMAGE="${VLLM_IMAGE_DEFAULT}"
 # Minimum host driver any NGC image pinned in this kit is known to work on:
@@ -70,12 +72,14 @@ NODE_IP=""
 CLIENT_SUBNETS=()
 HUB_LAN_IP=""
 MODEL_RECIPE=""
+CONFIG_PREFILLED=false
 
 # Deployment mode
 NON_SUDO_MODE=false
 USE_CURRENT_USER=false
 SYNC_KEYS_ONLY=false
 RESTART_ONLY=false
+STATUS_ONLY=false
 
 # --- Functions ---
 
@@ -166,6 +170,10 @@ parse_args() {
                 RESTART_ONLY=true
                 shift
                 ;;
+            --status)
+                STATUS_ONLY=true
+                shift
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -194,6 +202,9 @@ Options:
                       the inventory (by its IP) and re-apply its stack with
                       existing secrets and config. Fails if the node was
                       never deployed here.
+  --status            Report this node's install state (containers, health,
+                      GPU, model cache, endpoints) with a plain verdict.
+                      Never changes anything; safe to run unattended.
   --help, -h          Show this help message and exit
 
 The script will prompt you for all required information interactively.
@@ -277,7 +288,6 @@ prompt_node_ip() {
     else
         read -r -p "Enter node IP address: " NODE_IP
     fi
-
     if [ -z "${NODE_IP}" ]; then
         log_error "Node IP is required."
         prompt_node_ip
@@ -404,26 +414,39 @@ EOF
     log "Hub IP: ${HUB_LAN_IP}"
 }
 
-# Try to detect node from inventory by IP
+# Try to detect this node in the inventory by IP and, with one confirmation,
+# reuse everything recorded about it (id, role, recipe, hub IP) so a re-run
+# after an unattended/degraded deployment needs no retyping.
 try_detect_node() {
     if [ -z "${NODE_IP}" ]; then
         return 0
     fi
 
-    local node_id
+    local node_id detected_role detected_recipe detected_hub
     node_id=$(yq eval ".nodes[] | select(.lan_ip == \"${NODE_IP}\") | .node_id" "${INVENTORY_FILE}" 2>/dev/null || true)
-
-    if [ -n "${node_id}" ]; then
-        local detected_role
-        detected_role=$(yq eval ".nodes[] | select(.node_id == \"${node_id}\") | .role" "${INVENTORY_FILE}" 2>/dev/null || true)
-
-        log_info "Found existing node in inventory: ${node_id} (was: ${detected_role})"
-        read -r -p "Use this node ID? [Y/n]: " response
-        case "${response}" in
-            [nN]) ;;
-            *) NODE_ID="${node_id}" ;;
-        esac
+    if [ -z "${node_id}" ] || [ "${node_id}" = "null" ]; then
+        return 0
     fi
+
+    detected_role=$(yq eval ".nodes[] | select(.node_id == \"${node_id}\") | .role" "${INVENTORY_FILE}" 2>/dev/null || true)
+    detected_recipe=$(yq eval ".nodes[] | select(.node_id == \"${node_id}\") | .model_recipe" "${INVENTORY_FILE}" 2>/dev/null || true)
+    [ "${detected_recipe}" = "null" ] && detected_recipe=""
+
+    log_info "Found previous deployment in inventory: ${node_id} (role: ${detected_role}${detected_recipe:+, recipe: ${detected_recipe}})"
+    read -r -p "Reuse this configuration? [Y/n]: " response
+    case "${response}" in
+        [nN]) return 0 ;;
+    esac
+
+    NODE_ID="${node_id}"
+    NODE_ROLE="${detected_role}"
+    MODEL_RECIPE="${detected_recipe}"
+    if [[ "${detected_role}" == *worker* ]] && [[ "${detected_role}" != *hub* ]]; then
+        detected_hub=$(yq eval '.nodes[] | select(.role == "hub" or .role == "hub+worker") | .lan_ip' "${INVENTORY_FILE}" 2>/dev/null | head -1)
+        [ -n "${detected_hub}" ] && [ "${detected_hub}" != "null" ] && HUB_LAN_IP="${detected_hub}"
+    fi
+    CONFIG_PREFILLED=true
+    log "Reusing recorded configuration (change any answer by re-running and answering 'n')."
 }
 
 # Prompt for node ID
@@ -521,18 +544,31 @@ collect_user_input() {
 
     prompt_node_ip
     try_detect_node
-    prompt_role
-    sync_state_from_inventory
-
-    if is_worker; then
-        prompt_hub_ip
-    fi
-    if is_hub; then
-        prompt_client_subnets
-    fi
-    prompt_node_id
-    if is_worker; then
-        prompt_model_recipe
+    if [ "${CONFIG_PREFILLED}" = true ]; then
+        # Restore hub-side extras from the same recorded config.
+        if is_hub; then
+            local subnets
+            subnets=$(yq eval '.lab.client_subnets // [] | join(" ")' "${INVENTORY_FILE}" 2>/dev/null || true)
+            if [ -n "${subnets}" ]; then
+                # shellcheck disable=SC2206
+                CLIENT_SUBNETS=(${subnets})
+                log "Restored client subnets from inventory: ${CLIENT_SUBNETS[*]}"
+            fi
+        fi
+        echo ""
+    else
+        prompt_role
+        sync_state_from_inventory
+        if is_worker; then
+            prompt_hub_ip
+        fi
+        if is_hub; then
+            prompt_client_subnets
+        fi
+        prompt_node_id
+        if is_worker; then
+            prompt_model_recipe
+        fi
     fi
 
     echo ""
@@ -574,7 +610,8 @@ create_service_user() {
     if [ "${USE_CURRENT_USER}" = true ]; then
         SVC_UID=$(id -u)
         SVC_GID=$(id -g)
-        export SVC_UID SVC_GID
+        SVC_USERNAME=$(id -un)
+        export SVC_UID SVC_GID SVC_USERNAME
         return 0
     fi
 
@@ -595,6 +632,7 @@ create_service_user() {
 
     SVC_UID=$(id -u "${SERVICE_USER}")
     SVC_GID=$(id -g "${SERVICE_USER}")
+    SVC_USERNAME="${SERVICE_USER}"
     export SVC_UID SVC_GID
 }
 
@@ -1043,10 +1081,23 @@ deploy_worker() {
         log "Pulling worker image ${VLLM_IMAGE} (first pull is ~8.5 GB on arm64)..."
         if ! docker pull "${VLLM_IMAGE}"; then
             log_error "Could not pull ${VLLM_IMAGE}."
-            log_error "Check the image reference and tag format; NGC tags look like 26.04-py3."
+            log_error "Check the image reference and tag format; NGC tags look like 26.01-py3."
             log_error "If the tag has moved on, update VLLM_IMAGE_DEFAULT in infrastructure/deploy.sh, or pin vllm_image in the node's recipe."
             exit 1
         fi
+    fi
+
+    # Probe the image against the real driver. Image build floors (embedded
+    # in the NGC image) are the only source of truth; recipe-claimed floors
+    # can be wrong. One throwaway container: libnvidia-container's check
+    # runs in ~2s and names the required release when it fails.
+    local probe_out required_release
+    probe_out=$(docker run --rm --gpus all "${VLLM_IMAGE}" true 2>&1 || true)
+    required_release=$(echo "${probe_out}" | grep -oP '(?<=Driver Release )[0-9.]+' | head -1 || true)
+    if [ -n "${required_release}" ]; then
+        log_error "${VLLM_IMAGE} requires NVIDIA driver ${required_release}; this host has ${host_driver:-unknown}."
+        log_error "Pin an older NGC tag via 'vllm_image' in the node's recipe (community-validated on 580.x: 26.01-py3, 25.12.post1-py3), or upgrade the host driver (README: 'Driver baseline')."
+        exit 1
     fi
 
     local port_flags=()
@@ -1085,12 +1136,17 @@ deploy_worker() {
     # NGC vLLM images use a pass-through entrypoint: the command must be
     # "vllm serve <model> ...", NOT bare "--model ..." flags (exec would
     # parse "--model" as a shell option and abort).
+    # VLLM_MXFP4_BACKEND=marlin: GB10 (sm_121) has no native FP4 compute;
+    # NVFP4 MoE must run on Marlin or output is garbage/empty.
     docker run -d \
         --name "${container_name}" \
         --network "${DOCKER_NETWORK}" \
         --user "${SVC_UID}:${SVC_GID}" \
         --security-opt=no-new-privileges \
         --env HOME=/tmp \
+        --env USER="${SVC_USERNAME}" \
+        --env LOGNAME="${SVC_USERNAME}" \
+        --env VLLM_MXFP4_BACKEND=marlin \
         --env-file "${worker_env_file}" \
         "${cache_flags[@]}" \
         --gpus all \
@@ -1145,10 +1201,106 @@ load_node_from_inventory() {
     log "Restarting: ${NODE_ID} role=${NODE_ROLE} ip=${NODE_IP} recipe=${MODEL_RECIPE:-none}"
 }
 
+# Report this node's install state. Read-only; safe to run repeatedly and
+# unattended. Exit code: 0 healthy, 1 something is broken.
+show_status() {
+    echo "=========================================="
+    echo "  spark-kit-3 status: $(hostname)"
+    echo "=========================================="
+
+    local host_driver="unknown"
+    host_driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
+    if [ -n "${host_driver}" ]; then
+        echo "GPU driver:          ${host_driver} (kit baseline ${MIN_DRIVER_VERSION})"
+        if driver_meets_min "${host_driver}" "${MIN_DRIVER_VERSION}"; then
+            echo "  driver baseline:   OK"
+        else
+            echo "  driver baseline:   BELOW BASELINE (see README: Driver baseline)"
+        fi
+    else
+        echo "GPU driver:          not detected (nvidia-smi failed)"
+    fi
+
+    # Inventory record for this node (local file; no docker needed).
+    local my_ip my_id my_role my_recipe
+    my_ip=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+    my_id=$(yq eval ".nodes[] | select(.lan_ip == \"${my_ip}\") | .node_id" "${INVENTORY_FILE}" 2>/dev/null || true)
+    if [ -n "${my_id}" ] && [ "${my_id}" != "null" ]; then
+        my_role=$(yq eval ".nodes[] | select(.node_id == \"${my_id}\") | .role" "${INVENTORY_FILE}")
+        my_recipe=$(yq eval ".nodes[] | select(.node_id == \"${my_id}\") | .model_recipe" "${INVENTORY_FILE}" 2>/dev/null || true)
+        echo "Inventory record:    ${my_id} (role: ${my_role}${my_recipe:+, recipe: ${my_recipe}})"
+    else
+        echo "Inventory record:    none for IP ${my_ip:-?} (node never fully deployed here)"
+    fi
+
+    echo ""
+    echo "Containers (docker ps -a):"
+    if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
+        docker ps -a --filter "name=litellm" --filter "name=vllm-" \
+            --format "  {{.Names}}\t{{.Status}}\t{{.Image}}" || true
+    else
+        echo "  (docker not available from this user/daemon down)"
+    fi
+
+    echo ""
+    echo "Endpoints (probed only if their container is running):"
+    local broken=0
+    if command -v docker > /dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -qx "litellm-proxy"; then
+        if curl -fsS -o /dev/null -m 5 "http://${my_ip:-localhost}:${LITELLM_PORT}/health/liveliness" 2>/dev/null; then
+            echo "  LiteLLM  http://${my_ip:-?}:${LITELLM_PORT}/v1   healthy"
+        else
+            echo "  LiteLLM  http://${my_ip:-?}:${LITELLM_PORT}/v1   NOT RESPONDING (docker logs litellm-proxy)"
+            broken=1
+        fi
+    fi
+    if [ -n "${my_id}" ] && [ "${my_id}" != "null" ] && command -v docker > /dev/null 2>&1 \
+        && docker ps --format '{{.Names}}' | grep -qx "vllm-${my_id}"; then
+        if curl -fsS -o /dev/null -m 5 "http://localhost:${VLLM_PORT}/health" 2>/dev/null; then
+            echo "  vLLM     http://${my_ip:-?}:${VLLM_PORT}/v1    healthy"
+        else
+            echo "  vLLM     http://${my_ip:-?}:${VLLM_PORT}/v1    NOT RESPONDING (docker logs vllm-${my_id})"
+            broken=1
+        fi
+    fi
+    if docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -E '^(litellm|vllm-)' | grep -qiE 'restart|unhealthy|exited'; then
+        echo ""
+        echo "  [!] One or more containers are restarting/exited/unhealthy — see 'docker logs <name>'."
+        broken=1
+    fi
+
+    echo ""
+    echo "Model cache:"
+    local hf_cache="${GENERATED_DIR}/hf-cache"
+    if [ -d "${hf_cache}" ]; then
+        echo "  ${hf_cache}: $(du -sh "${hf_cache}" 2>/dev/null | cut -f1 || echo ?)"
+    else
+        echo "  ${hf_cache}: not created yet (first model download has not run)"
+    fi
+
+    echo ""
+    if [ "${broken}" = 0 ]; then
+        echo "Verdict: nothing looks broken. To confirm end-to-end: ./scripts/verify.sh"
+    else
+        echo "Verdict: BROKEN (see [!] items above). Re-run ./infrastructure/deploy.sh to repair;"
+        echo "it will offer to reuse this node's recorded configuration."
+    fi
+    return "${broken}"
+}
+
 # Main deployment
 main() {
     parse_args "$@"
     validate_mode
+    if [ "${STATUS_ONLY}" = true ]; then
+        # Read-only: needs only the yq flavor check; no service changes.
+        # shellcheck disable=SC1091
+        source "${KIT_DIR}/scripts/ensure-yq.sh"
+        ensure_yq || { log_error "Could not provision mikefarah/yq."; return 1; }
+        # shellcheck disable=SC1091
+        source "${KIT_DIR}/scripts/lib-driver.sh"
+        show_status
+        return $?
+    fi
     step "Checking prerequisites"
     check_prerequisites
     touch_generated_dir
