@@ -44,14 +44,18 @@ ensure_yq() {
     local url="https://github.com/mikefarah/yq/releases/download/${ver}/yq_linux_${arch}.tar.gz"
     mkdir -p "${KIT_DIR}/bin"
     echo "[+] Downloading mikefarah/yq ${ver} (${arch}) into ${KIT_DIR}/bin ..."
+    # The release tarball stores the binary as "./yq_linux_<arch>" (leading
+    # "./"), which some tar builds refuse to match by bare member name, so
+    # extract the whole archive and clean up the extra files.
     if command -v curl > /dev/null 2>&1; then
-        curl -fsSL "${url}" | tar -xz -C "${KIT_DIR}/bin" "yq_linux_${arch}" || return 1
+        curl -fsSL "${url}" | tar -xz -C "${KIT_DIR}/bin" || return 1
     elif command -v wget > /dev/null 2>&1; then
-        wget -qO- "${url}" | tar -xz -C "${KIT_DIR}/bin" "yq_linux_${arch}" || return 1
+        wget -qO- "${url}" | tar -xz -C "${KIT_DIR}/bin" || return 1
     else
         echo "ERROR: neither curl nor wget found; install mikefarah/yq manually." >&2
         return 1
     fi
+    rm -f "${KIT_DIR}/bin/yq.1" "${KIT_DIR}/bin/install-man-page.sh"
     mv "${KIT_DIR}/bin/yq_linux_${arch}" "${KIT_DIR}/bin/yq"
     chmod +x "${KIT_DIR}/bin/yq"
     export PATH="${KIT_DIR}/bin:${PATH}"
