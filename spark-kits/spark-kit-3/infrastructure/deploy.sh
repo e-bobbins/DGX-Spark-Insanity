@@ -37,26 +37,27 @@ SERVICE_GROUP="llm-svc"
 
 # Docker network
 DOCKER_NETWORK="spark-kit-llm-net"
+# Pinned subnet: ufw's FORWARD rules for container egress reference it (see
+# setup_firewall); a fixed subnet keeps those rules valid across restarts.
+DOCKER_NETWORK_SUBNET="172.30.0.0/24"
 
 # Pinned images (arm64-capable, GB10-compatible).
-# Single source of truth: docker-compose.hub.yml consumes these via env-file.
-# - vLLM: NVIDIA NGC multi-arch image. NGC tags are YY.MM-py3 format;
-#   linux/arm64 (GB10-capable) builds are included in current NGC vLLM images.
-#   NGC vLLM images pin a minimum host driver (see MIN_DRIVER_VERSION and the
-#   README driver section). Recipes can override the default via a
-#   `vllm_image` field when a model needs a different vLLM version.
+# Single source of truth: docker-compose.hub.yml consumes hub images via env-file.
+# - vLLM: the vLLM project's and NVIDIA's official DGX Spark path is the
+#   UPSTREAM image on the CUDA-13 track (vllm/vllm-openai:cu130-nightly),
+#   because cu130 matches the 580.x driver family DGX Spark ships. NGC
+#   nvcr.io/nvidia/vllm:* tags target newer driver branches (measured:
+#   26.04-py3 needs 595.58, 26.10-py3 needs 615.71) and crash-loop on 580.x.
+#   Plain :nightly is a moving target and has broken on driver 580 before;
+#   TODO: pin this image BY DIGEST after the first successful run on the
+#   fleet, and re-validate the digest on driver upgrades.
+#   deploy_worker probes the image against the real driver after pull —
+#   never trust a recipe's claimed floor over the probe.
+#   Image flavor decides the command form: NGC images need a literal
+#   "vllm serve" prefix (pass-through entrypoint); upstream vllm-openai
+#   images take the model id as the first positional argument.
 # - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
-#
-# Driver baseline: DGX Spark (GB10) ships the 580.x series (R580 branch,
-# minimum 580.65, first branch of CUDA 13). NGC vLLM image floors are set by
-# the image build, not just the CUDA family: empirically 26.04-py3 demands
-# 595.58 and 26.10-py3 demands 615.71, so both crash-loop on 580.x with
-# "compatibility mode is UNAVAILABLE" before the GPU is touched. The kit
-# default is therefore pinned to 26.01-py3, community-validated on GB10 with
-# the 580 driver (NVIDIA's own Spark recipes also use the 25.12/26.02 line).
-# deploy_worker probes every image against the real driver after pull —
-# never trust a recipe's claimed floor over the probe.
-VLLM_IMAGE_DEFAULT="nvcr.io/nvidia/vllm:26.01-py3"
+VLLM_IMAGE_DEFAULT="vllm/vllm-openai:cu130-nightly"
 # Runtime env copies (checked/set per-node; recipes may override the image).
 VLLM_IMAGE="${VLLM_IMAGE_DEFAULT}"
 # Minimum host driver any NGC image pinned in this kit is known to work on:
@@ -441,7 +442,10 @@ try_detect_node() {
     NODE_ID="${node_id}"
     NODE_ROLE="${detected_role}"
     MODEL_RECIPE="${detected_recipe}"
-    if [[ "${detected_role}" == *worker* ]] && [[ "${detected_role}" != *hub* ]]; then
+    if [[ "${detected_role}" == *hub* ]]; then
+        # hub and hub+worker host the hub endpoint themselves.
+        HUB_LAN_IP="${NODE_IP}"
+    else
         detected_hub=$(yq eval '.nodes[] | select(.role == "hub" or .role == "hub+worker") | .lan_ip' "${INVENTORY_FILE}" 2>/dev/null | head -1)
         [ -n "${detected_hub}" ] && [ "${detected_hub}" != "null" ] && HUB_LAN_IP="${detected_hub}"
     fi
@@ -645,6 +649,8 @@ setup_firewall() {
 
     log "Configuring firewall..."
 
+    ensure_container_forward_allowances
+
     ufw default deny incoming
     ufw allow ssh
 
@@ -658,6 +664,10 @@ setup_firewall() {
 
     if is_worker; then
         # Worker (or hub+worker): vLLM port reachable from the hub IP only.
+        if [ -z "${HUB_LAN_IP}" ]; then
+            log_error "Hub IP is empty; cannot write the vLLM firewall rule. Re-run the deploy and confirm the recorded configuration (or enter the hub IP when asked)."
+            exit 1
+        fi
         ufw allow from "${HUB_LAN_IP}" to any port "${VLLM_PORT}" proto tcp comment 'Worker Hub Access'
         log "Allowed vLLM port ${VLLM_PORT} from hub at ${HUB_LAN_IP}"
     fi
@@ -685,11 +695,19 @@ create_network() {
     fi
 
     if ! docker network inspect "${DOCKER_NETWORK}" &> /dev/null; then
-        docker network create "${DOCKER_NETWORK}" > /dev/null
-        log "Created Docker network: ${DOCKER_NETWORK}"
+        if ! docker network create --subnet "${DOCKER_NETWORK_SUBNET}" "${DOCKER_NETWORK}" > /dev/null; then
+            log_error "Could not create network ${DOCKER_NETWORK} with subnet ${DOCKER_NETWORK_SUBNET}."
+            log_error "The subnet may collide with an existing Docker network; choose another in infrastructure/deploy.sh (DOCKER_NETWORK_SUBNET)."
+            exit 1
+        fi
+        log "Created Docker network: ${DOCKER_NETWORK} (${DOCKER_NETWORK_SUBNET})"
     else
         log "Docker network ${DOCKER_NETWORK} already exists."
     fi
+
+    # The DOCKER-USER chain only exists once Docker has something to manage;
+    # (re-)apply the forwarding rules now that the network exists.
+    ensure_container_forward_allowances
 }
 
 # Generate secrets.
@@ -1011,7 +1029,7 @@ deploy_worker() {
     served_model_name=$(recipe_field "${MODEL_RECIPE}" "served_model_name" "${MODEL_RECIPE}")
     local max_model_len gpu_mem_util max_num_seqs tool_call_parser reasoning_parser
     max_model_len=$(recipe_field "${MODEL_RECIPE}" "max_model_len" "262144")
-    gpu_mem_util=$(recipe_field "${MODEL_RECIPE}" "gpu_memory_utilization" "0.8")
+    gpu_mem_util=$(recipe_field "${MODEL_RECIPE}" "gpu_memory_utilization" "0.6")
     max_num_seqs=$(recipe_field "${MODEL_RECIPE}" "max_num_seqs" "15")
     tool_call_parser=$(recipe_field "${MODEL_RECIPE}" "tool_call_parser" "qwen3_xml")
     reasoning_parser=$(recipe_field "${MODEL_RECIPE}" "reasoning_parser" "qwen3")
@@ -1096,7 +1114,7 @@ deploy_worker() {
     required_release=$(echo "${probe_out}" | grep -oP '(?<=Driver Release )[0-9.]+' | head -1 || true)
     if [ -n "${required_release}" ]; then
         log_error "${VLLM_IMAGE} requires NVIDIA driver ${required_release}; this host has ${host_driver:-unknown}."
-        log_error "Pin an older NGC tag via 'vllm_image' in the node's recipe (community-validated on 580.x: 26.01-py3, 25.12.post1-py3), or upgrade the host driver (README: 'Driver baseline')."
+        log_error "The upstream cu130 track (vllm/vllm-openai:cu130-nightly) matches the 580.x driver family; or upgrade the host driver (README: 'Driver baseline')."
         exit 1
     fi
 
@@ -1133,11 +1151,22 @@ deploy_worker() {
         cache_flags=(--env "HF_HUB_CACHE=/hf-cache" -v "${hf_cache_dir}:/hf-cache")
     fi
 
-    # NGC vLLM images use a pass-through entrypoint: the command must be
+    # NGC images use a pass-through entrypoint: the command must be
     # "vllm serve <model> ...", NOT bare "--model ..." flags (exec would
-    # parse "--model" as a shell option and abort).
+    # parse "--model" as a shell option and abort). Upstream vllm-openai
+    # images embed the OpenAI server as the entrypoint and take the model
+    # id as the first positional argument.
     # VLLM_MXFP4_BACKEND=marlin: GB10 (sm_121) has no native FP4 compute;
     # NVFP4 MoE must run on Marlin or output is garbage/empty.
+    local image_args=()
+    case "${VLLM_IMAGE}" in
+        vllm/vllm-openai*)
+            image_args=("${hf_model_name}")
+            ;;
+        *)
+            image_args=(vllm serve --model "${hf_model_name}")
+            ;;
+    esac
     docker run -d \
         --name "${container_name}" \
         --network "${DOCKER_NETWORK}" \
@@ -1159,8 +1188,7 @@ deploy_worker() {
         --health-retries 5 \
         --health-start-period 180s \
         "${VLLM_IMAGE}" \
-        vllm serve \
-        --model "${hf_model_name}" \
+        "${image_args[@]+"${image_args[@]}"}" \
         --served-model-name "${served_model_name}" \
         --host 0.0.0.0 \
         --port "${VLLM_PORT}" \
@@ -1287,6 +1315,72 @@ show_status() {
     return "${broken}"
 }
 
+# Ensure containers on the kit's bridge can reach the internet and each
+# other. ufw's default-forward policy + Docker's inserted chains silently
+# drop container egress on user-created bridges (observed: Errno 101 inside
+# containers while the host browses fine). Two layers, both idempotent:
+#   1. runtime: ACCEPT rules at the top of Docker's DOCKER-USER chain —
+#      evaluated before anything can drop the traffic;
+#   2. persistent: a marked block in /etc/ufw/after.rules so the rules
+#      survive reboots and `ufw reload`.
+ensure_container_forward_allowances() {
+    if [ "${NON_SUDO_MODE}" = true ]; then
+        return 0
+    fi
+
+    # 1. Runtime rules in DOCKER-USER (Docker guarantees this chain exists
+    #    and sits at the top of FORWARD).
+    if command -v iptables > /dev/null 2>&1 && iptables -L DOCKER-USER > /dev/null 2>&1; then
+        local -a rules=(
+            "-s ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+            "-s ${DOCKER_NETWORK_SUBNET} ! -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+            "-s ! ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+        )
+        local rule
+        # ${rule} is intentionally unquoted: each entry is multiple iptables
+        # arguments that must word-split.
+        # shellcheck disable=SC2086
+        for rule in "${rules[@]}"; do
+            if ! iptables -C DOCKER-USER ${rule} 2>/dev/null; then
+                iptables -I DOCKER-USER 1 ${rule}
+            fi
+        done
+        log "Container forwarding rules active in DOCKER-USER for ${DOCKER_NETWORK_SUBNET}"
+    else
+        log_warn "iptables/DOCKER-USER unavailable; relying on the persistent rules only."
+    fi
+
+    # 2. Persistent rules surviving reboot / ufw reload.
+    local rules_file="/etc/ufw/after.rules"
+    local marker_begin="# BEGIN spark-kit-3 container forwarding"
+    local marker_end="# END spark-kit-3 container forwarding"
+
+    if [ -f "${rules_file}" ] && grep -qF "${marker_begin}" "${rules_file}"; then
+        return 0
+    fi
+
+    log "Adding persistent container forwarding rules to ${rules_file}..."
+    local tmp
+    tmp=$(mktemp)
+    {
+        echo ""
+        echo "${marker_begin}"
+        echo "# Container egress + intra-bridge traffic for ${DOCKER_NETWORK} (fixes Errno 101)"
+        echo "-A ufw-after-forward -s ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+        echo "-A ufw-after-forward -s ${DOCKER_NETWORK_SUBNET} ! -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+        echo "-A ufw-after-forward -s ! ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+        echo "${marker_end}"
+    } > "${tmp}"
+    if ! cat "${tmp}" >> "${rules_file}"; then
+        rm -f "${tmp}"
+        log_error "Could not write to ${rules_file}."
+        return 1
+    fi
+    rm -f "${tmp}"
+    ufw reload > /dev/null 2>&1 || true
+    log "Persistent container forwarding rules installed."
+}
+
 # Main deployment
 main() {
     parse_args "$@"
@@ -1359,10 +1453,13 @@ main() {
 
     step "Creating service user"
     create_service_user
-    step "Preparing Docker network"
-    create_network
+    # Firewall BEFORE network/container creation: bringing ufw up after
+    # Docker has wired its iptables chains is what broke container egress
+    # (Errno 101, issue #14).
     step "Configuring firewall"
     setup_firewall
+    step "Preparing Docker network"
+    create_network
     step "Generating secrets"
     generate_secrets
 

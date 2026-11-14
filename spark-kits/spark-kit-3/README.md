@@ -216,33 +216,36 @@ mount fails, each worker downloads independently and deployment continues.
 Pinned in one place at the top of `infrastructure/deploy.sh` and passed to
 compose through the env file:
 
-- vLLM: `nvcr.io/nvidia/vllm:26.01-py3` (NGC tags follow `YY.MM-py3` and
-  include linux/arm64 builds; this is what makes it GB10-capable). NGC
-  image driver floors are set by the image build, not just the CUDA
-  family: measured on real Sparks, `26.04-py3` demands 595.58 and
-  `26.10-py3` demands 615.71 — both crash-loop on the stock 580 driver.
-  Community-validated on GB10 with 580.x: `26.01-py3`, `25.12.post1-py3`.
+- vLLM: `vllm/vllm-openai:cu130-nightly` — the upstream image on the
+  CUDA-13 track, which matches the 580.x driver family DGX Spark ships.
+  This is the path the vLLM project's own DGX Spark guide and NVIDIA's
+  official playbook use. The NGC images (`nvcr.io/nvidia/vllm:*`) target
+  newer driver branches — measured on real Sparks, `26.04-py3` demands
+  driver 595.58 and `26.10-py3` demands 615.71, so both crash-loop on the
+  stock 580 driver ("compatibility mode is UNAVAILABLE"). Plain
+  `:nightly` is a moving target and specific nightlies have broken on
+  driver 580. TODO: pin this image by digest once validated on the fleet.
   The deployment probes the pinned image against the actual driver after
-  pull and fails with the exact required version, so a wrong tag can never
-  crash-loop silently. Do **not** use upstream `vllm/vllm-openai:*` stable
-  images on GB10 — they lack SM121 support; NGC tags only (or the
-  `vllm/vllm-openai:cu130-nightly` track if you know you need it).
+  pull and fails with the exact required version, so a wrong tag can
+  never crash-loop silently.
 - LiteLLM: `ghcr.io/berriai/litellm:v1.83.7-stable`
 - Postgres: `pgvector/pgvector:pg17` (a superset of plain Postgres, kept so
   a stage-2 feature can adopt it without migration)
 
 ### Driver baseline
 
-NGC vLLM images pin a *minimum host driver branch*, and newer tags need
-newer drivers. DGX Spark (GB10) ships the 580.x series (R580 branch, floor
-580.65 — the first branch of CUDA 13). Images built on CUDA 13.4 or later
-(such as `26.10-py3`) require the R615 branch; on a 580.x host they abort
-at startup — before the GPU is touched — with a "compatibility mode is
-UNAVAILABLE" crash-loop (CUDA forward compatibility could not initialize).
+Container vLLM images pin a *minimum host driver branch*. DGX Spark (GB10)
+ships the 580.x series (R580 branch, floor 580.65 — the first branch of
+CUDA 13); image builds on newer CUDA (NGC `26.04-py3` and later) demand
+newer drivers and abort at startup — before the GPU is touched — with a
+"compatibility mode is UNAVAILABLE" crash-loop when the host is older and
+CUDA forward compatibility cannot initialize.
 Keep an eye on the NVIDIA vLLM release notes: the "Known Issues" section of
 each release states these platform quirks, including that
 `vllm serve` over-allocates on unified-memory platforms (Spark/Jetson)
-unless `--gpu-memory-utilization` is lowered — our default recipe uses 0.8.
+unless `--gpu-memory-utilization` is lowered — our default recipe uses 0.6
+(0.4 is the measured never-OOM value on this box, 0.8 OOMs under
+concurrency).
 
 The kit enforces this before deploying a worker: it reads the driver from
 `nvidia-smi` and fails fast — naming the image and the baseline it needs —
@@ -261,7 +264,7 @@ nvidia-smi   # confirm the new version
 If you would rather not upgrade, keep recipes pinned to images whose
 `min_driver` your fleet already meets. That is the reproducibility rule:
 
-- Every recipe may declare `vllm_image` (the NGC tag that model is
+- Every recipe may declare `vllm_image` (the image tag that model is
   validated against) and `min_driver` (the host driver floor for it).
   Fields omitted fall back to the kit defaults.
 - When adding a model, record the image/version pair that actually served
