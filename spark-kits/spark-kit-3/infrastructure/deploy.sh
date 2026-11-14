@@ -849,7 +849,9 @@ update_inventory() {
     else
         yq eval -i '.nodes += [{"node_id": env(NODE_ID), "role": env(NODE_ROLE), "lan_ip": env(NODE_IP), "model_recipe": null}]' "${INVENTORY_FILE}"
     fi
-    unset NODE_ID NODE_ROLE NODE_IP MODEL_RECIPE
+    # Drop the export attribute without undefining the globals: later code
+    # (is_hub / is_worker / summary) still reads them under set -u.
+    export -n NODE_ID NODE_ROLE NODE_IP MODEL_RECIPE
 }
 
 # Optional NFS model cache (spec: optional, root_squash, subnet-restricted).
