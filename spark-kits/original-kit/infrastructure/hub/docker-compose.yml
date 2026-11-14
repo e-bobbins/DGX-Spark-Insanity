@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: litellm-postgres
+    restart: unless-stopped
+    user: "${UID}:${GID}"
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: litellm
+      _CONTAINER_UID: ${UID}
+      _CONTAINER_GID: ${GID}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    networks:
+      - llm-net
+
+  litellm-new:
+    image: berriai/litellm:latest
+    container_name: litellm-new
+    restart: unless-stopped
+    user: "${UID}:${GID}"
+    command: >
+      --config /app/config.yaml
+      --port 4000
+      --detailed_debug
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      DATABASE_URL: postgresql://litellm:${DB_PASSWORD}:@postgres:5432/litellm
+    ports:
+      - "4000:4000" # Exposed to LAN via Host IP
+    networks:
+      llm-net:
+        aliases:
+          - litellm-service
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:
+
+networks:
+  llm-net:
+    driver: bridge
