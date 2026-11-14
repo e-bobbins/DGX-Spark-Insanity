@@ -40,10 +40,26 @@ DOCKER_NETWORK="spark-kit-llm-net"
 
 # Pinned images (arm64-capable, GB10-compatible).
 # Single source of truth: docker-compose.hub.yml consumes these via env-file.
-# - vLLM: NVIDIA NGC multi-arch image. NGC tags are YY.MM-py3 format; the
-#   linux/arm64 build is included (verified for 26.10-py3, signed).
+# - vLLM: NVIDIA NGC multi-arch image. NGC tags are YY.MM-py3 format;
+#   linux/arm64 (GB10-capable) builds are included in current NGC vLLM images.
+#   NGC vLLM images pin a minimum host driver (see MIN_DRIVER_VERSION and the
+#   README driver section). Recipes can override the default via a
+#   `vllm_image` field when a model needs a different vLLM version.
 # - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
-VLLM_IMAGE="nvcr.io/nvidia/vllm:26.10-py3"
+#
+# Driver baseline: DGX Spark (GB10) ships the 580.x series (R580 branch,
+# minimum 580.65, first branch of CUDA 13). NGC vLLM images built on CUDA
+# 13.4+ (e.g. 26.10-py3) need the R615 branch and hard-fail on 580.x when
+# CUDA forward compatibility cannot initialize — a crash-loop whose first
+# log lines read "compatibility mode is UNAVAILABLE". The kit default is
+# therefore pinned to 26.04-py3 (vLLM 0.19.0, CUDA 13.2.1), the tag
+# community-validated on GB10 with the 580 driver.
+VLLM_IMAGE_DEFAULT="nvcr.io/nvidia/vllm:26.04-py3"
+# Runtime env copies (checked/set per-node; recipes may override the image).
+VLLM_IMAGE="${VLLM_IMAGE_DEFAULT}"
+# Minimum host driver any NGC image pinned in this kit is known to work on:
+# the R580 branch floor. Recipes may raise it via `min_driver`.
+MIN_DRIVER_VERSION="580.65"
 LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.83.7-stable"
 POSTGRES_IMAGE="pgvector/pgvector:pg17"
 
@@ -217,6 +233,8 @@ check_prerequisites() {
     # ensure_yq checks the flavor and vendors a pinned copy if needed.
     # shellcheck disable=SC1091
     source "${KIT_DIR}/scripts/ensure-yq.sh"
+    # shellcheck disable=SC1091
+    source "${KIT_DIR}/scripts/lib-driver.sh"
     if ! ensure_yq; then
         log_error "Could not provision mikefarah/yq. See scripts/ensure-yq.sh."
         exit 1
@@ -975,9 +993,9 @@ deploy_worker() {
         echo "SVC_UID=${SVC_UID}"
         echo "SVC_GID=${SVC_GID}"
         echo "HUB_IP=${HUB_LAN_IP}"
-        if [ -d "/mnt/shared-models" ] && mountpoint -q "/mnt/shared-models" 2>/dev/null; then
-            echo "HF_HUB_CACHE=/mnt/shared-models"
-        fi
+        # HF model cache is NOT decided here: deploy_worker picks it after
+        # checking NFS, and mounts the matching volume. Nothing writes
+        # HF_HUB_CACHE into this env-file, so there is exactly one source.
     } > "${worker_env_file}"
     chmod 600 "${worker_env_file}"
     chown_svc "${worker_env_file}"
@@ -992,6 +1010,31 @@ deploy_worker() {
 
     log "Starting vLLM container for model: ${served_model_name}"
 
+    # Per-recipe image and driver floor: a recipe documents the NGC tag the
+    # model is validated against and the minimum host driver for it. Falls
+    # back to the kit defaults when the recipe omits the fields.
+    VLLM_IMAGE=$(recipe_field "${MODEL_RECIPE}" "vllm_image" "${VLLM_IMAGE_DEFAULT}")
+    local min_driver
+    min_driver=$(recipe_field "${MODEL_RECIPE}" "min_driver" "${MIN_DRIVER_VERSION}")
+
+    # Version compare: sort -V orders dotted versions correctly
+    # ("580.178.04" >= "580.00"; "526.x" < "580.00").
+    # One driver version per node is fine on GB10 (single GPU); with multiple
+    # lines we still take the first, which matches the primary GPU nvidia-smi
+    # initializes first in practice.
+    local host_driver
+    host_driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
+    if [ -n "${host_driver}" ]; then
+        log "Host NVIDIA driver: ${host_driver} (kit baseline >= ${MIN_DRIVER_VERSION})"
+        if ! driver_meets_min "${host_driver}" "${min_driver}"; then
+            log_error "Host NVIDIA driver ${host_driver} is below the baseline ${min_driver} required by ${VLLM_IMAGE}."
+            log_error "Upgrade the driver (see README: 'Driver baseline') or pick a recipe pinned to an older NGC image."
+            exit 1
+        fi
+    else
+        log_warn "Could not read the NVIDIA driver version via nvidia-smi; skipping the driver baseline check."
+    fi
+
     # Preflight: ensure the pinned image is usable. Skipped when already
     # pulled locally (use rollback + redeploy to force a fresh pull).
     if docker image inspect "${VLLM_IMAGE}" > /dev/null 2>&1; then
@@ -1000,8 +1043,8 @@ deploy_worker() {
         log "Pulling worker image ${VLLM_IMAGE} (first pull is ~8.5 GB on arm64)..."
         if ! docker pull "${VLLM_IMAGE}"; then
             log_error "Could not pull ${VLLM_IMAGE}."
-            log_error "Check the image reference and tag format; NGC tags look like 26.10-py3."
-            log_error "If the tag has moved on, update VLLM_IMAGE in infrastructure/deploy.sh and re-run."
+            log_error "Check the image reference and tag format; NGC tags look like 26.04-py3."
+            log_error "If the tag has moved on, update VLLM_IMAGE_DEFAULT in infrastructure/deploy.sh, or pin vllm_image in the node's recipe."
             exit 1
         fi
     fi
@@ -1020,12 +1063,36 @@ deploy_worker() {
 
     # vLLM needs shared memory for activation/compile buffers; size comes from
     # the recipe (shm_size). This is an ipc/disc setting, not host networking.
+    # HF model cache: exactly one mount + one HF_HUB_CACHE declaration, decided
+    # here. NFS takes precedence when mounted on the host (shared multi-node
+    # cache, mounted into the container at the same host path); otherwise a
+    # per-node host dir under GENERATED_DIR persists the ~18 GB download
+    # across container recreation/redeploys. The container runs as the
+    # service user, so the local dir must be owned by it. HOME is redirected
+    # to a writable path: with --user the image's default HOME (/ or /root)
+    # is unwritable and tooling (HF download, torch) dies on first write.
+    local cache_flags=()
+    if [ -d "/mnt/shared-models" ] && mountpoint -q "/mnt/shared-models" 2>/dev/null; then
+        log "Using NFS model cache at /mnt/shared-models"
+        cache_flags=(--env "HF_HUB_CACHE=/mnt/shared-models" -v "/mnt/shared-models:/mnt/shared-models")
+    else
+        local hf_cache_dir="${GENERATED_DIR}/hf-cache"
+        mkdir -p "${hf_cache_dir}"
+        chown_svc "${hf_cache_dir}"
+        cache_flags=(--env "HF_HUB_CACHE=/hf-cache" -v "${hf_cache_dir}:/hf-cache")
+    fi
+
+    # NGC vLLM images use a pass-through entrypoint: the command must be
+    # "vllm serve <model> ...", NOT bare "--model ..." flags (exec would
+    # parse "--model" as a shell option and abort).
     docker run -d \
         --name "${container_name}" \
         --network "${DOCKER_NETWORK}" \
         --user "${SVC_UID}:${SVC_GID}" \
         --security-opt=no-new-privileges \
+        --env HOME=/tmp \
         --env-file "${worker_env_file}" \
+        "${cache_flags[@]}" \
         --gpus all \
         --restart unless-stopped \
         --shm-size "${shm_size}" \
@@ -1036,6 +1103,7 @@ deploy_worker() {
         --health-retries 5 \
         --health-start-period 180s \
         "${VLLM_IMAGE}" \
+        vllm serve \
         --model "${hf_model_name}" \
         --served-model-name "${served_model_name}" \
         --host 0.0.0.0 \

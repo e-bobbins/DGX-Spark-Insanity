@@ -32,13 +32,15 @@ echo "=== Static checks ==="
 if command -v shellcheck > /dev/null 2>&1; then
     shellcheck "${KIT_DIR}/infrastructure/deploy.sh" \
                "${KIT_DIR}/scripts/verify.sh" \
-               "${KIT_DIR}/scripts/rollback.sh"
+               "${KIT_DIR}/scripts/rollback.sh" \
+               "${KIT_DIR}/scripts/ensure-yq.sh" \
+               "${KIT_DIR}/scripts/lib-driver.sh"
     check "shellcheck clean" $?
 else
     echo "  [SKIP] shellcheck not installed"
 fi
 
-for script in "${KIT_DIR}/infrastructure/deploy.sh" "${KIT_DIR}/scripts/verify.sh" "${KIT_DIR}/scripts/rollback.sh"; do
+for script in "${KIT_DIR}/infrastructure/deploy.sh" "${KIT_DIR}/scripts/verify.sh" "${KIT_DIR}/scripts/rollback.sh" "${KIT_DIR}/scripts/ensure-yq.sh" "${KIT_DIR}/scripts/lib-driver.sh"; do
     bash -n "$script"
     check "bash -n $(basename "$script")" $?
 done
@@ -126,6 +128,18 @@ check "per-worker api_base for spark-03" $(grep -q "api_base: http://10.0.0.32:8
 check "model from worker's own recipe (openai/acme/Other-Model-7B)" $(grep -q "model: openai/acme/Other-Model-7B" "${CFG}"; echo $?)
 check "no literal secret values in config" $(grep -q "testvalue" "${CFG}"; test $? -eq 1; echo $?)
 check "no shared/single api_key variable across routes" $(grep -q "api_key: os.environ/VLLM_API_KEY" "${CFG}"; test $? -eq 1; echo $?)
+
+echo ""
+echo "=== Driver baseline comparison (scripts/lib-driver.sh) ==="
+# shellcheck disable=SC1091
+source "${KIT_DIR}/scripts/lib-driver.sh"
+check "580.178.04 >= 580.00" $(driver_meets_min "580.178.04" "580.00"; echo $?)
+check "580.00 >= 580.00 (equal passes)" $(driver_meets_min "580.00" "580.00"; echo $?)
+check "615.71 >= 580.00" $(driver_meets_min "615.71" "580.00"; echo $?)
+check "526.14 < 580.00 rejected" $(driver_meets_min "526.14" "580.00"; [ $? -eq 1 ]; echo $?)
+check "570.00 < 580.00 rejected" $(driver_meets_min "570.00" "580.00"; [ $? -eq 1 ]; echo $?)
+check "615.71 >= 615.71 (recipe floor equal passes)" $(driver_meets_min "615.71" "615.71"; echo $?)
+check "580.99 < 581.00 rejected" $(driver_meets_min "580.99" "581.00"; [ $? -eq 1 ]; echo $?)
 
 echo ""
 echo "=== Summary ==="

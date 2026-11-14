@@ -36,6 +36,9 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       STORE_MODEL_IN_DB: "True"
       LOG_LEVEL: ERROR
+      # With a non-root --user override the image's default HOME (/ or /root)
+      # is unwritable; prisma then fails to create /.cache during migrate.
+      HOME: /tmp
     env_file:
       - ${SECRETS_DIR}/hub.env
     volumes:

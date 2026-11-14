@@ -216,12 +216,55 @@ mount fails, each worker downloads independently and deployment continues.
 Pinned in one place at the top of `infrastructure/deploy.sh` and passed to
 compose through the env file:
 
-- vLLM: `nvcr.io/nvidia/vllm:26.10-py3` (NGC tags follow `YY.MM-py3` and
-  include linux/arm64 builds; this is what makes it GB10-capable)
+- vLLM: `nvcr.io/nvidia/vllm:26.04-py3` (NGC tags follow `YY.MM-py3` and
+  include linux/arm64 builds; this is what makes it GB10-capable). Also
+  community-validated on GB10 with the 580 driver: `26.02+` and
+  `25.12.post1-py3`. Do **not** use upstream `vllm/vllm-openai:*` stable
+  images on GB10 — they lack SM121 support; NGC tags only (or the
+  `vllm/vllm-openai:cu130-nightly` track if you know you need it).
 - LiteLLM: `ghcr.io/berriai/litellm:v1.83.7-stable`
 - Postgres: `pgvector/pgvector:pg17` (a superset of plain Postgres, kept so
   a stage-2 feature can adopt it without migration)
 
+### Driver baseline
+
+NGC vLLM images pin a *minimum host driver branch*, and newer tags need
+newer drivers. DGX Spark (GB10) ships the 580.x series (R580 branch, floor
+580.65 — the first branch of CUDA 13). Images built on CUDA 13.4 or later
+(such as `26.10-py3`) require the R615 branch; on a 580.x host they abort
+at startup — before the GPU is touched — with a "compatibility mode is
+UNAVAILABLE" crash-loop (CUDA forward compatibility could not initialize).
+Keep an eye on the NVIDIA vLLM release notes: the "Known Issues" section of
+each release states these platform quirks, including that
+`vllm serve` over-allocates on unified-memory platforms (Spark/Jetson)
+unless `--gpu-memory-utilization` is lowered — our default recipe uses 0.8.
+
+The kit enforces this before deploying a worker: it reads the driver from
+`nvidia-smi` and fails fast — naming the image and the baseline it needs —
+when the host driver is too old. The baseline lives in `MIN_DRIVER_VERSION`
+in `infrastructure/deploy.sh`.
+
+How to upgrade the driver on the Spark (DGX OS, needs a reboot):
+
+```bash
+sudo apt update
+sudo apt install --only-upgrade nvidia-driver  # or: sudo apt full-upgrade
+sudo reboot
+nvidia-smi   # confirm the new version
+```
+
+If you would rather not upgrade, keep recipes pinned to images whose
+`min_driver` your fleet already meets. That is the reproducibility rule:
+
+- Every recipe may declare `vllm_image` (the NGC tag that model is
+  validated against) and `min_driver` (the host driver floor for it).
+  Fields omitted fall back to the kit defaults.
+- When adding a model, record the image/version pair that actually served
+  it in the recipe. The deploy then reproduces it on any Spark meeting
+  that driver floor, and refuses to half-deploy on one that doesn't.
+- A mismatch `min_driver: "615.71"` with a `580.x` host fails the worker
+  deploy with the README pointer, rather than crash-looping for hours. The
+  check runs per-worker; a hub already deployed on the same node stays up.
 ### Known limitations
 
 - Worker key sync is manual (`--sync-keys`) by design; no automation.
@@ -229,7 +272,8 @@ compose through the env file:
 - vLLM serving profiles (standard chat vs agentic flag sets) are a single
   recipe value today; profile support is tracked in the issues.
 - Redeploy recreates containers and vLLM re-downloads the model unless the
-  NFS cache is enabled. Fixing that is tracked in the issues.
+  NFS cache is enabled. A per-node host-path model cache landed with the
+  driver-baseline work; NFS remains optional.
 - Stage 2 work (monitoring dashboards, TLS, automated student keys) is not
   started. See issue #1.
 
