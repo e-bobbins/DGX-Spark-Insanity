@@ -96,6 +96,14 @@ validate_sudo() {
     fi
 }
 
+# yq must be mikefarah's flavor (vendor/download if not); sourced helper.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/ensure-yq.sh"
+if ! ensure_yq; then
+    log_error "Could not provision mikefarah/yq."
+    exit 1
+fi
+
 # Detect current node
 get_current_node() {
     CURRENT_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)

@@ -80,8 +80,9 @@ log_info() {
 }
 
 # Progress tracker: call step "Doing X" before each major phase.
+# STEP_TOTAL is set in main() once the role is known.
 STEP_NUM=0
-STEP_TOTAL=9
+STEP_TOTAL=10
 step() {
     STEP_NUM=$((STEP_NUM + 1))
     printf '\n[%d/%d] %s...\n' "${STEP_NUM}" "${STEP_TOTAL}" "$1"
@@ -212,17 +213,13 @@ check_prerequisites() {
         exit 1
     fi
 
-    # Check yq for YAML parsing (install if missing)
-    if ! command -v yq &> /dev/null; then
-        log "yq not found. Installing..."
-        if command -v apt-get &> /dev/null && [ "${NON_SUDO_MODE}" = false ]; then
-            apt-get update -qq && apt-get install -y -qq yq 2>&1 | grep -v "^Selecting\|^Preparing\|^Unpacking\|^Setting" || true
-        elif command -v apk add &> /dev/null && [ "${NON_SUDO_MODE}" = false ]; then
-            apk add --no-cache yq
-        else
-            log_error "Cannot install yq without root. Please install yq (https://github.com/mikefarah/yq) and try again."
-            exit 1
-        fi
+    # yq: mikefarah flavor only (the apt "yq" package is a different program).
+    # ensure_yq checks the flavor and vendors a pinned copy if needed.
+    # shellcheck disable=SC1091
+    source "${KIT_DIR}/scripts/ensure-yq.sh"
+    if ! ensure_yq; then
+        log_error "Could not provision mikefarah/yq. See scripts/ensure-yq.sh."
+        exit 1
     fi
 
     log "All prerequisites met."
@@ -1087,6 +1084,7 @@ main() {
     touch_generated_dir
 
     if [ "${RESTART_ONLY}" = true ]; then
+        STEP_TOTAL=5
         step "Reading node configuration from inventory"
         load_node_from_inventory
         step "Preparing service user and secrets"
@@ -1110,6 +1108,7 @@ main() {
     fi
 
     if [ "${SYNC_KEYS_ONLY}" = true ]; then
+        STEP_TOTAL=4
         if [ ! -f "${SECRETS_DIR}/hub.env" ]; then
             log_error "No hub.env found; run a full deploy on this node first."
             exit 1
@@ -1132,6 +1131,9 @@ main() {
 
     step "Collecting configuration"
     collect_user_input
+
+    # Step total depends on the role chosen: hub takes 10 steps, worker 8.
+    if is_hub; then STEP_TOTAL=10; else STEP_TOTAL=8; fi
 
     step "Creating service user"
     create_service_user

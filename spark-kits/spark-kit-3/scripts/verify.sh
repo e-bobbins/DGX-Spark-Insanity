@@ -99,6 +99,14 @@ if [ ! -f "${INVENTORY_FILE}" ]; then
     exit 1
 fi
 
+# yq must be mikefarah's flavor (vendor/download if not); sourced helper.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/ensure-yq.sh"
+if ! ensure_yq; then
+    echo "ERROR: could not provision mikefarah/yq." >&2
+    exit 1
+fi
+
 # Local node IP (host-scoped checks apply to the machine we run on)
 LOCAL_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
 

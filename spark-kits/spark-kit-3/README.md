@@ -240,5 +240,7 @@ compose through the env file:
 ```
 
 Runs shellcheck over every script and exercises the LiteLLM config
-generation against a stubbed `yq`, no Docker needed. Runtime behavior needs
+generation against a vendored stub, no Docker needed. The scripts fetch
+their own pinned `yq` (`mikefarah/yq`) on first run if a usable copy is not
+installed. Runtime behavior needs
 a real node; `scripts/verify.sh` is the check there.
