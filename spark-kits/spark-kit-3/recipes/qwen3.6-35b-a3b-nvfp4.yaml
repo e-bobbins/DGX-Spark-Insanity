@@ -7,13 +7,13 @@
 model_name: "nvidia/Qwen3.6-35B-A3B-NVFP4"
 
 # vLLM image this model is validated against.
-# The upstream cu130 track matches the DGX Spark's 580.x driver family
+# Upstream cu130 track matches the DGX Spark's 580.x driver family
 # (CUDA 13.0); NGC nvcr.io tags need newer drivers (measured: 26.04-py3
-# -> 595.58, 26.10-py3 -> 615.71). Plain :nightly is a moving target.
-# TODO: pin by digest after the first successful fleet run, and pin the
-# command form: upstream images take the model id as the first positional
-# argument (no "vllm serve" prefix).
-vllm_image: "vllm/vllm-openai:cu130-nightly"
+# -> 595.58, 26.10-py3 -> 615.71). PINNED BY DIGEST: validated on
+# driver 580.178.04 (boots, correct flags, model loader runs).
+# Command form: both image families need the literal "vllm serve" prefix
+# (entrypoint is the vLLM CLI); handled by deploy.sh.
+vllm_image: "vllm/vllm-openai@sha256:3dbe092ec5b2cef63b6104d33fa75d6ce53a7870962529ada69f78bbbc38e776"
 
 # Minimum host NVIDIA driver for the pinned image (nvidia-smi version).
 # 580.65 = floor of the R580 branch; deployment fails fast with a clear

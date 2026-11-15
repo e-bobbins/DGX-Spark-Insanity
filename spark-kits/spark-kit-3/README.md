@@ -224,7 +224,9 @@ compose through the env file:
   driver 595.58 and `26.10-py3` demands 615.71, so both crash-loop on the
   stock 580 driver ("compatibility mode is UNAVAILABLE"). Plain
   `:nightly` is a moving target and specific nightlies have broken on
-  driver 580. TODO: pin this image by digest once validated on the fleet.
+  driver 580. The current default is digest-pinned:
+  `vllm/vllm-openai@sha256:3dbe092e...` (the exact cu130-nightly validated
+  on driver 580.178.04); re-validate a new digest on driver upgrades.
   The deployment probes the pinned image against the actual driver after
   pull and fails with the exact required version, so a wrong tag can
   never crash-loop silently.
@@ -276,7 +278,8 @@ If you would rather not upgrade, keep recipes pinned to images whose
 ### Known limitations
 
 - Worker key sync is manual (`--sync-keys`) by design; no automation.
-- Image pins are version tags, not digests. Digests would be stricter.
+- The vLLM image is digest-pinned; the LiteLLM/Postgres pins are version
+  tags. Digest pinning there is pending.
 - vLLM serving profiles (standard chat vs agentic flag sets) are a single
   recipe value today; profile support is tracked in the issues.
 - Redeploy recreates containers and vLLM re-downloads the model unless the

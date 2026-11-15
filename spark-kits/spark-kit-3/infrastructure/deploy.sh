@@ -48,16 +48,19 @@ DOCKER_NETWORK_SUBNET="172.30.0.0/24"
 #   because cu130 matches the 580.x driver family DGX Spark ships. NGC
 #   nvcr.io/nvidia/vllm:* tags target newer driver branches (measured:
 #   26.04-py3 needs 595.58, 26.10-py3 needs 615.71) and crash-loop on 580.x.
+#   nvcr.io/nvidia/vllm:* tags target newer driver branches (measured:
+#   26.04-py3 needs 595.58, 26.10-py3 needs 615.71) and crash-loop on 580.x.
 #   Plain :nightly is a moving target and has broken on driver 580 before;
-#   TODO: pin this image BY DIGEST after the first successful run on the
-#   fleet, and re-validate the digest on driver upgrades.
+#   so the default below is PINNED BY DIGEST — the exact cu130-nightly
+#   image validated on driver 580.178.04 (boots, all flags parse, model
+#   loader runs). Re-validate a new digest on every driver upgrade.
 #   deploy_worker probes the image against the real driver after pull —
 #   never trust a recipe's claimed floor over the probe.
-#   Image flavor decides the command form: NGC images need a literal
-#   "vllm serve" prefix (pass-through entrypoint); upstream vllm-openai
-#   images take the model id as the first positional argument.
+#   Command form: both image families (NGC pass-through entrypoint and
+#   upstream vllm-openai whose entrypoint is the vLLM CLI itself) need a
+#   literal "vllm serve" prefix — see deploy_worker.
 # - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
-VLLM_IMAGE_DEFAULT="vllm/vllm-openai:cu130-nightly"
+VLLM_IMAGE_DEFAULT="vllm/vllm-openai@sha256:3dbe092ec5b2cef63b6104d33fa75d6ce53a7870962529ada69f78bbbc38e776"
 # Runtime env copies (checked/set per-node; recipes may override the image).
 VLLM_IMAGE="${VLLM_IMAGE_DEFAULT}"
 # Minimum host driver any NGC image pinned in this kit is known to work on:
@@ -810,6 +813,10 @@ sync_worker_keys() {
         local wid wip
         wid="$(echo "${entry}" | awk '{print $1}')"
         wip="$(echo "${entry}" | awk '{print $2}')"
+        if [ -z "${wid}" ] || [ "${wid}" = "null" ] || [ -z "${wip}" ] || [ "${wip}" = "null" ]; then
+            log_warn "Skipping malformed inventory entry: '${entry}' (empty node_id or lan_ip)."
+            continue
+        fi
 
         local existing="${SECRETS_DIR}/worker_keys/${wid}.txt"
         if [ -s "${existing}" ]; then
@@ -880,6 +887,13 @@ LITELLM_CONFIG_ENTRY
         wid="$(echo "${entry}" | cut -d'|' -f1)"
         wip="$(echo "${entry}" | cut -d'|' -f2)"
         wrecipe="$(echo "${entry}" | cut -d'|' -f3)"
+
+        # Skip malformed inventory rows (empty id/ip would generate an
+        # unrouteable 'http://:8000' endpoint and a confusing key warning).
+        if [ -z "${wid}" ] || [ "${wid}" = "null" ] || [ -z "${wip}" ] || [ "${wip}" = "null" ]; then
+            log_warn "Skipping malformed inventory entry: '${entry}' (empty node_id or lan_ip)."
+            continue
+        fi
 
         [ -f "${KIT_DIR}/recipes/${wrecipe}.yaml" ] || wrecipe="qwen3.6-35b-a3b-nvfp4"
         hf=$(recipe_field "${wrecipe}" "model_name" "nvidia/Qwen3.6-35B-A3B-NVFP4")
@@ -1151,22 +1165,14 @@ deploy_worker() {
         cache_flags=(--env "HF_HUB_CACHE=/hf-cache" -v "${hf_cache_dir}:/hf-cache")
     fi
 
-    # NGC images use a pass-through entrypoint: the command must be
-    # "vllm serve <model> ...", NOT bare "--model ..." flags (exec would
-    # parse "--model" as a shell option and abort). Upstream vllm-openai
-    # images embed the OpenAI server as the entrypoint and take the model
-    # id as the first positional argument.
+    # Both image families present the vLLM CLI at container start (NGC uses
+    # a pass-through entrypoint; upstream vllm-openai's entrypoint IS
+    # /usr/local/bin/vllm — verified on node: positional model ids and
+    # arbitrary commands both get parsed as CLI args). So the command must
+    # always be "vllm serve <model> ..."; bare "--model" or a model id alone
+    # is parsed as a CLI subcommand and aborts.
     # VLLM_MXFP4_BACKEND=marlin: GB10 (sm_121) has no native FP4 compute;
     # NVFP4 MoE must run on Marlin or output is garbage/empty.
-    local image_args=()
-    case "${VLLM_IMAGE}" in
-        vllm/vllm-openai*)
-            image_args=("${hf_model_name}")
-            ;;
-        *)
-            image_args=(vllm serve --model "${hf_model_name}")
-            ;;
-    esac
     docker run -d \
         --name "${container_name}" \
         --network "${DOCKER_NETWORK}" \
@@ -1188,7 +1194,8 @@ deploy_worker() {
         --health-retries 5 \
         --health-start-period 180s \
         "${VLLM_IMAGE}" \
-        "${image_args[@]+"${image_args[@]}"}" \
+        vllm serve \
+        --model "${hf_model_name}" \
         --served-model-name "${served_model_name}" \
         --host 0.0.0.0 \
         --port "${VLLM_PORT}" \
@@ -1323,18 +1330,114 @@ show_status() {
 #      evaluated before anything can drop the traffic;
 #   2. persistent: a marked block in /etc/ufw/after.rules so the rules
 #      survive reboots and `ufw reload`.
+# Resolve the subnet rules must allow. The pinned default only applies to
+# networks we create; a network that already exists (e.g. from an earlier
+# deploy, auto-assigned subnet) keeps its subnet — allow THAT, or container
+# egress stays broken while the rules point at a subnet nothing uses.
+resolve_network_subnet() {
+    local subnet
+    if docker network inspect "${DOCKER_NETWORK}" > /dev/null 2>&1; then
+        subnet=$(docker network inspect "${DOCKER_NETWORK}" \
+            --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | head -1)
+    fi
+    echo "${subnet:-${DOCKER_NETWORK_SUBNET}}"
+}
+
+# Provision what Docker's disabled iptables integration would have done:
+# ip_forward on, MASQUERADE for the bridge subnet, FORWARD accepts.
+# Idempotent; filter rule persistence lives in the after.rules block, and
+# NAT persistence in the marked block in /etc/ufw/before.rules.
+ensure_manual_container_nat() {
+    local subnet="$1"
+
+    # IP forwarding (runtime + persistent).
+    if [ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]; then
+        sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    fi
+    local sysctl_file="/etc/sysctl.d/60-spark-kit-3-forward.conf"
+    if [ ! -f "${sysctl_file}" ] || ! grep -q "net.ipv4.ip_forward=1" "${sysctl_file}"; then
+        echo "net.ipv4.ip_forward=1" > "${sysctl_file}"
+    fi
+
+    # MASQUERADE for container egress (nat POSTROUTING). Runtime + persistent
+    # (ufw's nat table lives in before.rules; append a marked block there).
+    # ${masq_rule} is deliberately word-split at the call sites below.
+    local masq_rule="-s ${subnet} ! -d ${subnet} -j MASQUERADE"
+    # shellcheck disable=SC2086
+    if ! iptables -t nat -C POSTROUTING ${masq_rule} 2>/dev/null; then
+        # shellcheck disable=SC2086
+        iptables -t nat -A POSTROUTING ${masq_rule}
+    fi
+
+    local nat_file="/etc/ufw/before.rules"
+    local nat_begin="# BEGIN spark-kit-3 container NAT"
+    local nat_end="# END spark-kit-3 container NAT"
+    if ! grep -qF "${nat_begin}" "${nat_file}"; then
+        # ufw's before.rules starts its *nat table at the top; append a
+        # dedicated nat section after the filter sections (ufw supports
+        # multiple table sections).
+        local tmp
+        tmp=$(mktemp)
+        {
+            echo ""
+            echo "*nat"
+            echo "${nat_begin}"
+            echo ":POSTROUTING ACCEPT [0:0]"
+            echo "-A POSTROUTING ${masq_rule}"
+            echo "${nat_end}"
+            echo "COMMIT"
+        } > "${tmp}"
+        if ! cat "${tmp}" >> "${nat_file}";  then
+            rm -f "${tmp}"
+            log_warn "Could not persist NAT rules to ${nat_file} (runtime NAT is active; it will be re-applied on next deploy)."
+        else
+            rm -f "${tmp}"
+        fi
+    fi
+
+    # FORWARD accepts (runtime; filter persistence comes from after.rules).
+    local -a fwd_rules=(
+        "-s ${subnet} -d ${subnet} -j ACCEPT"
+        "-s ${subnet} ! -d ${subnet} -j ACCEPT"
+        "-d ${subnet} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    )
+    local rule
+    # ${rule} is intentionally unquoted: each entry is multiple iptables
+    # arguments that must word-split.
+    # shellcheck disable=SC2086
+    for rule in "${fwd_rules[@]}"; do
+        if ! iptables -C FORWARD ${rule} 2>/dev/null; then
+            iptables -I FORWARD 1 ${rule}
+        fi
+    done
+    log "Manual container NAT + forwarding provisioned for ${subnet}"
+}
+
 ensure_container_forward_allowances() {
     if [ "${NON_SUDO_MODE}" = true ]; then
         return 0
     fi
 
-    # 1. Runtime rules in DOCKER-USER (Docker guarantees this chain exists
-    #    and sits at the top of FORWARD).
-    if command -v iptables > /dev/null 2>&1 && iptables -L DOCKER-USER > /dev/null 2>&1; then
+    # 1. Runtime rules. Preferred: Docker's DOCKER-USER chain (top of
+    #    FORWARD). Fallback: if the chain does not exist, Docker's iptables
+    #    integration is disabled on this host (observed on one Spark:
+    #    daemon.json iptables=false) — then containers have no masquerade
+    #    and NO route out (Errno 101) no matter what filter rules we add, so
+    #    provision ip_forward + NAT + FORWARD accepts by hand.
+    local ipt_ok="no"
+    local ipt_err=""
+    if ipt_err=$(iptables -L DOCKER-USER 2>&1); then
+        ipt_ok="yes"
+    fi
+
+    local subnet
+    subnet=$(resolve_network_subnet)
+
+    if [ "${ipt_ok}" = "yes" ]; then
         local -a rules=(
-            "-s ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
-            "-s ${DOCKER_NETWORK_SUBNET} ! -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
-            "-s ! ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+            "-s ${subnet} -d ${subnet} -j ACCEPT"
+            "-s ${subnet} ! -d ${subnet} -j ACCEPT"
+            "-s ! ${subnet} -d ${subnet} -j ACCEPT"
         )
         local rule
         # ${rule} is intentionally unquoted: each entry is multiple iptables
@@ -1342,12 +1445,16 @@ ensure_container_forward_allowances() {
         # shellcheck disable=SC2086
         for rule in "${rules[@]}"; do
             if ! iptables -C DOCKER-USER ${rule} 2>/dev/null; then
-                iptables -I DOCKER-USER 1 ${rule}
+                if ! iptables -I DOCKER-USER 1 ${rule}; then
+                    log_warn "Could not add forwarding rule '${rule}' to DOCKER-USER."
+                fi
             fi
         done
-        log "Container forwarding rules active in DOCKER-USER for ${DOCKER_NETWORK_SUBNET}"
+        log "Container forwarding rules active in DOCKER-USER for ${subnet}"
     else
-        log_warn "iptables/DOCKER-USER unavailable; relying on the persistent rules only."
+        log_warn "DOCKER-USER chain missing (${ipt_err})."
+        log_warn "Docker's iptables integration appears disabled; provisioning NAT + forwarding manually."
+        ensure_manual_container_nat "${subnet}"
     fi
 
     # 2. Persistent rules surviving reboot / ufw reload.
@@ -1356,19 +1463,20 @@ ensure_container_forward_allowances() {
     local marker_end="# END spark-kit-3 container forwarding"
 
     if [ -f "${rules_file}" ] && grep -qF "${marker_begin}" "${rules_file}"; then
-        return 0
+        # Subnet may have changed (network recreated); refresh the block.
+        sed -i "/${marker_begin}/,/${marker_end}/d" "${rules_file}"
     fi
 
-    log "Adding persistent container forwarding rules to ${rules_file}..."
+    log "Writing persistent container forwarding rules (${subnet}) to ${rules_file}..."
     local tmp
     tmp=$(mktemp)
     {
         echo ""
         echo "${marker_begin}"
         echo "# Container egress + intra-bridge traffic for ${DOCKER_NETWORK} (fixes Errno 101)"
-        echo "-A ufw-after-forward -s ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
-        echo "-A ufw-after-forward -s ${DOCKER_NETWORK_SUBNET} ! -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
-        echo "-A ufw-after-forward -s ! ${DOCKER_NETWORK_SUBNET} -d ${DOCKER_NETWORK_SUBNET} -j ACCEPT"
+        echo "-A ufw-after-forward -s ${subnet} -d ${subnet} -j ACCEPT"
+        echo "-A ufw-after-forward -s ${subnet} ! -d ${subnet} -j ACCEPT"
+        echo "-A ufw-after-forward -s ! ${subnet} -d ${subnet} -j ACCEPT"
         echo "${marker_end}"
     } > "${tmp}"
     if ! cat "${tmp}" >> "${rules_file}"; then
@@ -1378,7 +1486,7 @@ ensure_container_forward_allowances() {
     fi
     rm -f "${tmp}"
     ufw reload > /dev/null 2>&1 || true
-    log "Persistent container forwarding rules installed."
+    log "Persistent container forwarding rules installed for ${subnet}."
 }
 
 # Main deployment
