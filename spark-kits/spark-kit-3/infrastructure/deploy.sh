@@ -140,10 +140,11 @@ wait_healthy() {
 validate_mode() {
     # Check if --non-sudo flag was passed
     if [ "${NON_SUDO_MODE}" = true ]; then
-        if [ "$(id -u)" = "0" ]; then
-            log_warn "Running as root with --non-sudo flag. Using current user mode."
-            USE_CURRENT_USER=true
-        fi
+        # Non-sudo mode ALWAYS runs containers as the invoking user: an
+        # unprivileged account cannot chown anything to the service user,
+        # and that is the point of the mode (no privilege escalation, no
+        # root-owned artifacts in the user's tree).
+        USE_CURRENT_USER=true
         log_warn "Running in non-sudo mode - Security features will be degraded!"
         log_warn "  - Containers will run as current user (not isolated service user)"
         log_warn "  - Firewall will not be configured (vLLM may be exposed to LAN)"
