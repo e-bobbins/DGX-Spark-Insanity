@@ -1,18 +1,32 @@
-# Recipe: nvidia/Qwen3.6-35B-A3B-NVFP4
+# Recipe: RedHatAI/Qwen3.6-35B-A3B-NVFP4
 # Default model for DGX Spark LLM Stack
 # Optimized for agentic workloads on 128GB unified memory (Grace-Blackwell GB10)
+#
+# Checkpoint note: the nvidia/ NVFP4 export of this model is a ModelOpt
+# quantization (quantized lm_head + w1/w2/w3 input scales) that the pinned
+# vLLM build cannot load (KeyError: layers.0.mlp.experts.w2_input_scale,
+# vllm issues #44081/#45102, confirmed live on GB10). The RedHatAI export
+# uses llm-compressor / compressed-tensors nvfp4-pack-quantized, which the
+# same build loads and serves correctly (verified on GB10, driver
+# 580.178.04: load, health 200, coherent generation).
+# The nvidia ModelOpt path needed VLLM_MXFP4_BACKEND=marlin on GB10; the
+# compressed-tensors path runs FlashInfer CUTLASS FP4 natively. That env
+# was removed from deploy.sh.
 
 # HuggingFace model identifier
 # This is the actual model checkpoint that will be loaded
-model_name: "nvidia/Qwen3.6-35B-A3B-NVFP4"
+model_name: "RedHatAI/Qwen3.6-35B-A3B-NVFP4"
+
+# Exact HF revision of the checkpoint (weights uploaded 6fca074; e94a930
+# is the tested main snapshot). Passed as --revision: every node loads
+# byte-identical weights.
+revision: "e94a930"
 
 # vLLM image this model is validated against.
 # Upstream cu130 track matches the DGX Spark's 580.x driver family
 # (CUDA 13.0); NGC nvcr.io tags need newer drivers (measured: 26.04-py3
 # -> 595.58, 26.10-py3 -> 615.71). PINNED BY DIGEST: validated on
-# driver 580.178.04 (boots, correct flags, model loader runs).
-# Command form: both image families need the literal "vllm serve" prefix
-# (entrypoint is the vLLM CLI); handled by deploy.sh.
+# driver 580.178.04 (boots, load_weights, health 200, generation OK).
 vllm_image: "vllm/vllm-openai@sha256:3dbe092ec5b2cef63b6104d33fa75d6ce53a7870962529ada69f78bbbc38e776"
 
 # Minimum host NVIDIA driver for the pinned image (nvidia-smi version).
@@ -33,14 +47,15 @@ tool_call_parser: "qwen3_xml"
 reasoning_parser: "qwen3"
 
 # Maximum model length (context window)
-# 262144 = 256K tokens
+# 262144 = 256K tokens. NOTE: serving was verified at 131072; 262144 is
+# the intended production setting but needs a boot re-check after the
+# checkpoint switch (KV cache profiling happens at deploy time).
 max_model_len: 262144
 
 # GPU memory utilization
 # Everything on GB10 shares one 128GB unified memory pool; vLLM over-
 # allocates at its ~1.0 default and 0.8 OOMs under concurrency. 0.6 is the
-# kit default (measured 0.4 = never-OOM conservative on this box; NVIDIA's
-# 120B recipe uses 0.75). ~35GB weights + KV cache + host overhead.
+# kit default (measured 0.4 = never-OOM conservative on this box).
 gpu_memory_utilization: 0.6
 
 # Maximum number of concurrent sequences
@@ -53,15 +68,14 @@ max_num_seqs: 15
 shm_size: "16g"
 
 # Enable automatic tool choice
-# Allows vLLM to automatically select appropriate tools
 enable_auto_tool_choice: true
 
-# Trust remote code
-# Required for some model functionalities
-trust_remote_code: true
+# Trust remote code: NOT required for this checkpoint (loads and serves
+# without it). Keeping it off closes an arbitrary-code surface.
+trust_remote_code: false
 
-# Additional vLLM flags (optional)
-# These will be passed directly to the vLLM command line
-# Example:
-#   --dump-config: false
-#   --log-level: INFO
+# Additional vLLM serve flags passed to the container command.
+# Whitespace split, single tokens only. --quantization selects the
+# compressed-tensors loader for this checkpoint; --moe-backend picks the
+# FlashInfer CUTLASS FP4 MoE kernel (verified working on GB10/sm_121).
+extra_flags: "--quantization compressed-tensors --moe-backend flashinfer_cutlass"

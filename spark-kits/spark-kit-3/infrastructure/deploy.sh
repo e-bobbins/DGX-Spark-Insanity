@@ -1054,6 +1054,9 @@ deploy_worker() {
     auto_tool_choice=$(recipe_field "${MODEL_RECIPE}" "enable_auto_tool_choice" "true")
     trust_remote=$(recipe_field "${MODEL_RECIPE}" "trust_remote_code" "true")
     shm_size=$(recipe_field "${MODEL_RECIPE}" "shm_size" "2g")
+    local model_revision extra_flags_str
+    model_revision=$(recipe_field "${MODEL_RECIPE}" "revision" "")
+    extra_flags_str=$(recipe_field "${MODEL_RECIPE}" "extra_flags" "")
 
     local worker_config_dir="${GENERATED_DIR}/workers"
     mkdir -p "${worker_config_dir}"
@@ -1151,6 +1154,13 @@ deploy_worker() {
     local extra_flags=()
     [ "${auto_tool_choice}" = "true" ] && extra_flags+=("--enable-auto-tool-choice")
     [ "${trust_remote}" = "true" ] && extra_flags+=("--trust-remote-code")
+    # Recipe-pinned checkpoint revision: selects the exact HF revision so
+    # every node loads byte-identical weights.
+    [ -n "${model_revision}" ] && extra_flags+=("--revision" "${model_revision}")
+    # Recipe-declared vLLM serve flags, whitespace split. Quotes inside the
+    # field are not honored; use single-token flags in the recipe.
+    # shellcheck disable=SC2206
+    extra_flags+=(${extra_flags_str})
 
     # vLLM needs shared memory for activation/compile buffers; size comes from
     # the recipe (shm_size). This is an ipc/disc setting, not host networking.
@@ -1186,8 +1196,6 @@ deploy_worker() {
     # So: probe the image's entrypoint after pull and add the "vllm serve"
     # prefix only when the entrypoint is pass-through (empty or neither
     # vllm nor serve).
-    # VLLM_MXFP4_BACKEND=marlin: GB10 (sm_121) has no native FP4 compute;
-    # NVFP4 MoE must run on Marlin or output is garbage/empty.
     local vllm_entrypoint serve_prefix
     vllm_entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "${VLLM_IMAGE}" 2>/dev/null || echo null)
     serve_prefix=("vllm" "serve")
@@ -1202,7 +1210,6 @@ deploy_worker() {
         --env HOME=/tmp \
         --env USER="${SVC_USERNAME}" \
         --env LOGNAME="${SVC_USERNAME}" \
-        --env VLLM_MXFP4_BACKEND=marlin \
         --env-file "${worker_env_file}" \
         "${cache_flags[@]}" \
         --gpus all \
