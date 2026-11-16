@@ -28,7 +28,9 @@ SECRETS_DIR="${KIT_DIR}/secrets"
 
 # Default ports
 LITELLM_PORT="4000"
-VLLM_PORT="8000"
+# Worker port. SPARK_KIT_VLLM_PORT lets a second kit instance on the same
+# node (e.g. a testbed account) avoid colliding with a running worker.
+VLLM_PORT="${SPARK_KIT_VLLM_PORT:-8000}"
 POSTGRES_PORT="5432"
 
 # Service user
@@ -56,9 +58,9 @@ DOCKER_NETWORK_SUBNET="172.30.0.0/24"
 #   loader runs). Re-validate a new digest on every driver upgrade.
 #   deploy_worker probes the image against the real driver after pull —
 #   never trust a recipe's claimed floor over the probe.
-#   Command form: both image families (NGC pass-through entrypoint and
-#   upstream vllm-openai whose entrypoint is the vLLM CLI itself) need a
-#   literal "vllm serve" prefix — see deploy_worker.
+#   Command form: "vllm serve" is prefixed only when the image entrypoint is
+#   pass-through (NGC); upstream images whose entrypoint already ends in
+#   vLLM/serve get bare serve flags — see deploy_worker.
 # - LiteLLM: stable branch tag from BerriAI's published images (cosign-signed).
 VLLM_IMAGE_DEFAULT="vllm/vllm-openai@sha256:3dbe092ec5b2cef63b6104d33fa75d6ce53a7870962529ada69f78bbbc38e776"
 # Runtime env copies (checked/set per-node; recipes may override the image).
@@ -1165,14 +1167,27 @@ deploy_worker() {
         cache_flags=(--env "HF_HUB_CACHE=/hf-cache" -v "${hf_cache_dir}:/hf-cache")
     fi
 
-    # Both image families present the vLLM CLI at container start (NGC uses
-    # a pass-through entrypoint; upstream vllm-openai's entrypoint IS
-    # /usr/local/bin/vllm — verified on node: positional model ids and
-    # arbitrary commands both get parsed as CLI args). So the command must
-    # always be "vllm serve <model> ..."; bare "--model" or a model id alone
-    # is parsed as a CLI subcommand and aborts.
+    # Command form depends on the image's entrypoint, which differs between
+    # image families AND between upstream builds:
+    #   - NGC images: pass-through entrypoint -> the command must be the full
+    #     "vllm serve <model> ..." (bare "--model" gets parsed as a CLI
+    #     subcommand and aborts).
+    #   - Upstream vllm-openai (cu130-nighly, digest 3dbe092e and later):
+    #     ENTRYPOINT is ["vllm","serve"] -> a literal "vllm serve" prefix
+    #     would double up ("unrecognized arguments: vllm serve"); the command
+    #     must be bare serve flags. Earlier upstream builds had the CLI as
+    #     the entrypoint, where "vllm serve ..." also works.
+    # So: probe the image's entrypoint after pull and add the "vllm serve"
+    # prefix only when the entrypoint is pass-through (empty or neither
+    # vllm nor serve).
     # VLLM_MXFP4_BACKEND=marlin: GB10 (sm_121) has no native FP4 compute;
     # NVFP4 MoE must run on Marlin or output is garbage/empty.
+    local vllm_entrypoint serve_prefix
+    vllm_entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "${VLLM_IMAGE}" 2>/dev/null || echo null)
+    serve_prefix=("vllm" "serve")
+    if echo "${vllm_entrypoint}" | grep -q -e '"vllm' -e 'vllm"' -e 'serve' ; then
+        serve_prefix=()
+    fi
     docker run -d \
         --name "${container_name}" \
         --network "${DOCKER_NETWORK}" \
@@ -1194,7 +1209,7 @@ deploy_worker() {
         --health-retries 5 \
         --health-start-period 180s \
         "${VLLM_IMAGE}" \
-        vllm serve \
+        ${serve_prefix[@]+"${serve_prefix[@]}"} \
         --model "${hf_model_name}" \
         --served-model-name "${served_model_name}" \
         --host 0.0.0.0 \
