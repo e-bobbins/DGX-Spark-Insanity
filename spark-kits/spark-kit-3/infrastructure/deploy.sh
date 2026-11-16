@@ -1127,7 +1127,12 @@ deploy_worker() {
     # can be wrong. One throwaway container: libnvidia-container's check
     # runs in ~2s and names the required release when it fails.
     local probe_out required_release
-    probe_out=$(docker run --rm --gpus all "${VLLM_IMAGE}" true 2>&1 || true)
+    # --entrypoint true: the check only needs libnvidia-container's stderr
+    # ("Driver Release ..." requirement line), which fires at container
+    # start. Running the image's real entrypoint here executes its actual
+    # command ("vllm serve true" on serve-entrypoint digests) and can take
+    # minutes or hang the deploy (issue #19).
+    probe_out=$(docker run --rm --gpus all --entrypoint true "${VLLM_IMAGE}" 2>&1 || true)
     required_release=$(echo "${probe_out}" | grep -oP '(?<=Driver Release )[0-9.]+' | head -1 || true)
     if [ -n "${required_release}" ]; then
         log_error "${VLLM_IMAGE} requires NVIDIA driver ${required_release}; this host has ${host_driver:-unknown}."
