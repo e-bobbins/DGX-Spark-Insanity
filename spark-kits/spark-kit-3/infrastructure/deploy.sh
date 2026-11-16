@@ -1508,9 +1508,13 @@ ensure_container_forward_allowances() {
 # Main deployment
 main() {
     parse_args "$@"
-    validate_mode
+    if [ "${STATUS_ONLY}" = false ]; then
+        validate_mode
+    fi
     if [ "${STATUS_ONLY}" = true ]; then
         # Read-only: needs only the yq flavor check; no service changes.
+        # Runs without sudo by design — status is the node operator's
+        # unattended health check and must not require privilege.
         # shellcheck disable=SC1091
         source "${KIT_DIR}/scripts/ensure-yq.sh"
         ensure_yq || { log_error "Could not provision mikefarah/yq."; return 1; }
