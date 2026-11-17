@@ -833,6 +833,21 @@ generate_secrets() {
             log "Generated LiteLLM master key with sk- prefix."
         fi
 
+        # LiteLLM UI login (admin panel). Explicit credentials generated once
+        # and reused on every redeploy; read via secrets/ui_username.txt and
+        # secrets/ui_password.txt.
+        local UI_USERNAME_FILE="${SECRETS_DIR}/ui_username.txt"
+        local UI_PASSWORD_FILE="${SECRETS_DIR}/ui_password.txt"
+        if [ ! -f "${UI_USERNAME_FILE}" ]; then
+            (umask 077 && echo "admin" > "${UI_USERNAME_FILE}")
+            chown_svc "${UI_USERNAME_FILE}"
+        fi
+        if [ ! -f "${UI_PASSWORD_FILE}" ]; then
+            (umask 077 && openssl rand -hex 16 > "${UI_PASSWORD_FILE}")
+            chown_svc "${UI_PASSWORD_FILE}"
+            log "Generated LiteLLM UI password."
+        fi
+
         local vllm_self_key=""
         if is_worker; then
             vllm_self_key="$(cat "${SECRETS_DIR}/vllm_api_key.txt")"
@@ -843,6 +858,9 @@ generate_secrets() {
         {
             echo "DB_PASSWORD=$(cat "${DB_PASSWORD_FILE}")"
             echo "LITELLM_MASTER_KEY=$(cat "${LITELLM_MASTER_KEY_FILE}")"
+            # LiteLLM UI login (admin panel); values from ui_username/_password.
+            echo "LITELLM_UI_USERNAME=$(cat "${UI_USERNAME_FILE}")"
+            echo "LITELLM_UI_PASSWORD=$(cat "${UI_PASSWORD_FILE}")"
             echo "DATABASE_URL=postgresql://litellm:$(cat "${DB_PASSWORD_FILE}")@postgres:${POSTGRES_PORT}/litellm"
             echo "NODE_IP=${NODE_IP}"
             echo "LITELLM_IMAGE=${LITELLM_IMAGE}"
@@ -1005,7 +1023,10 @@ LITELLM_CONFIG_ENTRY
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  disable_env_credential_login: true
+  # false: allow UI login via LITELLM_UI_USERNAME / LITELLM_UI_PASSWORD
+  # (deploy-generated, stored under secrets/). true would lock the admin
+  # panel out entirely — no DB user exists to log in with.
+  disable_env_credential_login: false
 LITELLM_CONFIG_FOOTER
 
     log "Generated LiteLLM config: ${config_file}"
@@ -1413,6 +1434,7 @@ show_status() {
     if command -v docker > /dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -qx "litellm-proxy"; then
         if curl -fsS -o /dev/null -m 5 "http://${my_ip:-localhost}:${LITELLM_PORT}/health/liveliness" 2>/dev/null; then
             echo "  LiteLLM  http://${my_ip:-?}:${LITELLM_PORT}/v1   healthy"
+            echo "  LiteLLM UI: http://${my_ip:-?}:${LITELLM_PORT}/ui — login in ${SECRETS_DIR}/ui_username.txt / ui_password.txt (sudo cat)"
         else
             echo "  LiteLLM  http://${my_ip:-?}:${LITELLM_PORT}/v1   NOT RESPONDING (docker logs litellm-proxy)"
             broken=1
@@ -1775,6 +1797,8 @@ main() {
     log "=== Deployment Complete ==="
     if is_hub; then
         log "LiteLLM endpoint: http://${NODE_IP}:${LITELLM_PORT}/v1"
+        log "LiteLLM UI (admin panel): http://${NODE_IP}:${LITELLM_PORT}/ui"
+        log "LiteLLM UI login: $(cat "${SECRETS_DIR}/ui_username.txt" 2>/dev/null || echo "?") / password in ${KIT_DIR}/secrets/ui_password.txt (read: sudo cat ...)"
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - ensure port ${LITELLM_PORT} is secured manually"
         fi
