@@ -1124,7 +1124,7 @@ provision_ui_admin() {
     if [ "${http_code}" != "200" ] && [ "${http_code}" != "201" ]; then
         log_warn "Could not create admin user via /user/new (HTTP ${http_code}) (user may already exist); continuing."
     fi
-    user_id="$(yq eval '.user_id // ""' "${user_resp}" 2>/dev/null || true)"
+    user_id="$(yq eval '.user_id // ""' "${user_resp}" 2>/dev/null | tr -d '"' || true)"
     rm -f "${user_resp}"
     if [ -z "${user_id}" ] || [ "${user_id}" = "null" ]; then
         # User from an earlier deploy (409): recover the id via /user/list.
@@ -1134,13 +1134,13 @@ provision_ui_admin() {
     fi
     if [ -z "${user_id}" ] || [ "${user_id}" = "null" ]; then
         # Last resort: the stored invitation's user_id.
-        user_id="$(yq eval '.user_id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
+        user_id="$(yq eval '.user_id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null | tr -d '"' || true)"
     fi
 
     # 2. Mint (or reuse) the invitation.
     local invite_id
     if [ -f "${SECRETS_DIR}/admin_invite.json" ]; then
-        invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
+        invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null | tr -d '"' || true)"
     fi
     local resp
     resp=$(mktemp)
@@ -1154,7 +1154,7 @@ provision_ui_admin() {
         if [ "${http_code}" = "200" ] || [ "${http_code}" = "201" ]; then
             (umask 077 && cp "${resp}" "${SECRETS_DIR}/admin_invite.json")
             chown_svc "${SECRETS_DIR}/admin_invite.json"
-            invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
+            invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null | tr -d '"' || true)"
             return 0
         fi
         return 1
@@ -1177,13 +1177,13 @@ provision_ui_admin() {
     # when the invitation is missing, expired, or already accepted.
     get_onboarding_jwt() {
         wrapped_jwt=$(curl -s -m 30 "http://${NODE_IP}:${LITELLM_PORT}/onboarding/get_token?invite_link=${invite_id}" \
-            2>/dev/null | yq eval '.token // ""' - 2>/dev/null || true)
+            2>/dev/null | yq eval '.token // ""' - 2>/dev/null | tr -d '"' || true)
         payload=$(printf '%s' "${wrapped_jwt}" | cut -d. -f2 | tr '_-' '/+')
         case $(( ${#payload} % 4 )) in
             2) payload="${payload}==" ;;
             3) payload="${payload}=" ;;
         esac
-        onboarding_jwt=$(printf '%s' "${payload}" | base64 -d 2>/dev/null | yq eval '.key // ""' - 2>/dev/null || true)
+        onboarding_jwt=$(printf '%s' "${payload}" | base64 -d 2>/dev/null | yq eval '.key // ""' - 2>/dev/null | tr -d '"' || true)
         [ -n "${onboarding_jwt}" ]
     }
     if ! get_onboarding_jwt; then
@@ -2053,7 +2053,7 @@ main() {
             log "Admin UI account email: $(cat "${SECRETS_DIR}/admin_email.txt" 2>/dev/null || echo "?")"
             if [ -f "${SECRETS_DIR}/admin_invite.json" ]; then
                 local invite_id invite_url
-                invite_id=$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)
+                invite_id=$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null | tr -d '"' || true)
                 invite_url="http://${NODE_IP}:${LITELLM_PORT}/ui/onboarding?invitation_id=${invite_id}"
                 log "Set YOUR password now — invitation link (copy it somewhere safe; NOT shown again; expires in 7 days):"
                 log "  ${invite_url:-see ${KIT_DIR}/secrets/admin_invite.json}"
