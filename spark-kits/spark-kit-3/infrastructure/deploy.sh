@@ -770,6 +770,18 @@ create_network() {
         fi
         log "Created Docker network: ${DOCKER_NETWORK} (${DOCKER_NETWORK_SUBNET})"
     else
+        # Reconcile: an existing network (created by an earlier deploy, the
+        # non-sudo path, or by hand) may be on a different subnet than the
+        # one requested now. Firewall rules must target the LIVE subnet, so
+        # adopt it and warn if it differs from what was asked for.
+        local live_subnet
+        live_subnet=$(resolve_network_subnet)
+        if [ -n "${live_subnet}" ] && [ "${live_subnet}" != "${DOCKER_NETWORK_SUBNET}" ]; then
+            log_warn "Docker network ${DOCKER_NETWORK} exists on subnet ${live_subnet}, but ${DOCKER_NETWORK_SUBNET} was requested."
+            log_warn "Adopting the live subnet ${live_subnet} for firewall rules so container-to-worker traffic is not dropped (#14 cause 3)."
+            log_warn "To move the network to ${DOCKER_NETWORK_SUBNET}: stop the kit's containers, 'docker network rm ${DOCKER_NETWORK}', then redeploy."
+            DOCKER_NETWORK_SUBNET="${live_subnet}"
+        fi
         log "Docker network ${DOCKER_NETWORK} already exists."
     fi
 
