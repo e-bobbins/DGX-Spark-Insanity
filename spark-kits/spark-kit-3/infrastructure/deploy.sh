@@ -1127,8 +1127,13 @@ provision_ui_admin() {
     user_id="$(yq eval '.user_id // ""' "${user_resp}" 2>/dev/null || true)"
     rm -f "${user_resp}"
     if [ -z "${user_id}" ] || [ "${user_id}" = "null" ]; then
-        # User from an earlier deploy: fetch id via /user/get_users?  Fall back
-        # to the stored invitation's user_id.
+        # User from an earlier deploy (409): recover the id via /user/list.
+        user_id=$(curl -s -m 30 "http://${NODE_IP}:${LITELLM_PORT}/user/list?user_email=${email}" \
+            -H "Authorization: Bearer ${master_key}" 2>/dev/null \
+            | yq eval ".users[] | select(.user_email == \"${email}\") | .user_id" - 2>/dev/null | head -1 || true)
+    fi
+    if [ -z "${user_id}" ] || [ "${user_id}" = "null" ]; then
+        # Last resort: the stored invitation's user_id.
         user_id="$(yq eval '.user_id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
     fi
 
@@ -1139,7 +1144,7 @@ provision_ui_admin() {
     fi
     local resp
     resp=$(mktemp)
-    if [ -z "${invite_id}" ] || [ "${invite_id}" = "null" ]; then
+    mint_invitation() {
         http_code=$(curl -s -o "${resp}" -w "%{http_code}" -m 30 \
             -X POST "http://${NODE_IP}:${LITELLM_PORT}/invitation/new" \
             -H "Authorization: Bearer ${master_key}" \
@@ -1150,7 +1155,12 @@ provision_ui_admin() {
             (umask 077 && cp "${resp}" "${SECRETS_DIR}/admin_invite.json")
             chown_svc "${SECRETS_DIR}/admin_invite.json"
             invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
-        else
+            return 0
+        fi
+        return 1
+    }
+    if [ -z "${invite_id}" ] || [ "${invite_id}" = "null" ]; then
+        if ! mint_invitation; then
             log_warn "Could not create admin invitation via /invitation/new (HTTP ${http_code}); claiming not attempted."
             rm -f "${resp}"
             return 0
@@ -1160,22 +1170,36 @@ provision_ui_admin() {
     # 3. Claim the invitation exactly as /ui/onboarding does: exchange the
     #    invitation id for a short-lived onboarding JWT, then set the password.
     local onboarding_jwt wrapped_jwt payload
-    # get_token returns "token": a JWT wrapping ReturnedUITokenObject whose
-    # "key" field is the raw onboarding JWT (token_type=litellm_onboarding).
-    # claim_token's Authorization header wants that inner JWT, so decode it out.
-    wrapped_jwt=$(curl -s -m 30 "http://${NODE_IP}:${LITELLM_PORT}/onboarding/get_token?invite_link=${invite_id}" \
-        2>/dev/null | yq eval '.token // ""' - 2>/dev/null || true)
-    payload=$(printf '%s' "${wrapped_jwt}" | cut -d. -f2 | tr '_-' '/+')
-    case $(( ${#payload} % 4 )) in
-        2) payload="${payload}==" ;;
-        3) payload="${payload}=" ;;
-    esac
-    onboarding_jwt=$(printf '%s' "${payload}" | base64 -d 2>/dev/null | yq eval '.key // ""' - 2>/dev/null || true)
-    if [ -z "${onboarding_jwt}" ]; then
-        log_warn "Could not extract the onboarding token from /onboarding/get_token; falling back to the manual invite link."
-        (umask 077 && mkdir -p "${SECRETS_DIR}" && printf '%s' "${wrapped_jwt}" > "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)
-        chown_svc "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true
-        return 0
+    # Extract the invitation's onboarding token. get_token returns "token": a
+    # JWT wrapping ReturnedUITokenObject whose "key" field is the raw
+    # onboarding JWT (token_type=litellm_onboarding); claim_token's
+    # Authorization header wants that inner JWT, so decode it out. Fails (empty)
+    # when the invitation is missing, expired, or already accepted.
+    get_onboarding_jwt() {
+        wrapped_jwt=$(curl -s -m 30 "http://${NODE_IP}:${LITELLM_PORT}/onboarding/get_token?invite_link=${invite_id}" \
+            2>/dev/null | yq eval '.token // ""' - 2>/dev/null || true)
+        payload=$(printf '%s' "${wrapped_jwt}" | cut -d. -f2 | tr '_-' '/+')
+        case $(( ${#payload} % 4 )) in
+            2) payload="${payload}==" ;;
+            3) payload="${payload}=" ;;
+        esac
+        onboarding_jwt=$(printf '%s' "${payload}" | base64 -d 2>/dev/null | yq eval '.key // ""' - 2>/dev/null || true)
+        [ -n "${onboarding_jwt}" ]
+    }
+    if ! get_onboarding_jwt; then
+        # Stored invitation is unusable (used/expired) — mint a fresh one once.
+        log "Stored invitation not usable; minting a fresh one."
+        if mint_invitation && get_onboarding_jwt; then
+            :
+        else
+            log_warn "Could not obtain an onboarding token; falling back to the manual invite link."
+            [ -z "${invite_id}" ] || [ "${invite_id}" = "null" ] && invite_id=""
+            printf '%s' "{\"id\":\"${invite_id}\",\"user_id\":\"${user_id}\"}" \
+                | (umask 077 && tee "${SECRETS_DIR}/admin_invite.json" >/dev/null)
+            chown_svc "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true
+            rm -f "${resp}"
+            return 0
+        fi
     fi
     http_code=$(curl -s -o "${resp}" -w "%{http_code}" -m 30 \
         -X POST "http://${NODE_IP}:${LITELLM_PORT}/onboarding/claim_token" \
