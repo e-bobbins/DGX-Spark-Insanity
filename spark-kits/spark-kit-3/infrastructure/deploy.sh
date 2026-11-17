@@ -882,10 +882,43 @@ generate_secrets() {
             (umask 077 && echo "${ADMIN_UI_EMAIL:-admin@lab.local}" > "${ADMIN_EMAIL_FILE}")
             chown_svc "${ADMIN_EMAIL_FILE}"
         fi
-        if [ ! -f "${ADMIN_PASSWORD_FILE}" ]; then
-            (umask 077 && openssl rand -hex 16 > "${ADMIN_PASSWORD_FILE}")
+        # LiteLLM's default password policy requires upper, lower, digit and
+        # special characters; rotate any existing non-compliant password too.
+        _generate_admin_password() {
+            local p
+            while :; do
+                p="$(openssl rand -base64 18 | tr -d '\n')"
+                case "${p}" in
+                    *[A-Z]*) ;;
+                    *) continue ;;
+                esac
+                case "${p}" in
+                    *[a-z]*|*[0-9]*|*[!A-Za-z0-9]*) ;;
+                    *) continue ;;
+                esac
+                echo "${p}"
+                return 0
+            done
+        }
+        local _admin_pw_policy_ok=1
+        if [ -f "${ADMIN_PASSWORD_FILE}" ]; then
+            local _existing_pw
+            _existing_pw="$(cat "${ADMIN_PASSWORD_FILE}")"
+            case "${_existing_pw}" in
+                *[A-Z]*) ;;
+                *) _admin_pw_policy_ok=0 ;;
+            esac
+            case "${_existing_pw}" in
+                *[!A-Za-z0-9]*) ;;
+                *) _admin_pw_policy_ok=0 ;;
+            esac
+        else
+            _admin_pw_policy_ok=0
+        fi
+        if [ "${_admin_pw_policy_ok}" != "1" ]; then
+            (umask 077 && _generate_admin_password > "${ADMIN_PASSWORD_FILE}")
             chown_svc "${ADMIN_PASSWORD_FILE}"
-            log "Generated Admin UI password for $(cat "${ADMIN_EMAIL_FILE}")."
+            log "Generated Admin UI password (policy-compliant) for $(cat "${ADMIN_EMAIL_FILE}")."
         fi
 
         local vllm_self_key=""
