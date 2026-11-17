@@ -1088,10 +1088,11 @@ LITELLM_CONFIG_FOOTER
     chown_svc "${config_file}"
 }
 
-# Provision an Admin UI invitation for the DB-backed proxy-admin account.
-# This LiteLLM build refuses passwords via /user/new; the user sets their
-# own password through the returned invite link. Idempotent per stored
-# invite; --secure-ui finalizes by disabling bootstrap env login.
+# Provision the DB-backed Admin UI account (proxy admin) end-to-end:
+# create user, mint invitation, claim it via the API (identical to LiteLLM's
+# /ui/onboarding flow: the invitation link is the secret that authorizes
+# setting the password; we hold it in secrets/admin_invite.json, root 0600),
+# verify the new login, then disable bootstrap env-credential login.
 provision_ui_admin() {
     local marker="${SECRETS_DIR}/env_login_disabled"
     if [ -f "${marker}" ]; then
@@ -1099,10 +1100,11 @@ provision_ui_admin() {
         return 0
     fi
 
-    local email
+    local email password
     email="$(cat "${SECRETS_DIR}/admin_email.txt" 2>/dev/null || echo "")"
-    if [ -z "${email}" ]; then
-        log_warn "Admin email file missing; skipping admin invitation (bootstrap env login stays enabled)."
+    password="$(cat "${SECRETS_DIR}/admin_ui_password.txt" 2>/dev/null || echo "")"
+    if [ -z "${email}" ] || [ -z "${password}" ]; then
+        log_warn "Admin email/password files missing; skipping admin provisioning (bootstrap env login stays enabled)."
         return 0
     fi
 
@@ -1110,8 +1112,8 @@ provision_ui_admin() {
     master_key="$(cat "${SECRETS_DIR}/litellm_master_key.txt")"
 
     # 1. Create the user record (no password — this build refuses passwords
-    #    via /user/new; the password is set via the invitation link).
-    local user_resp
+    #    via /user/new; the password is set by claiming the invitation).
+    local user_resp user_id
     user_resp=$(mktemp)
     http_code=$(curl -s -o "${user_resp}" -w "%{http_code}" -m 30 \
         -X POST "http://${NODE_IP}:${LITELLM_PORT}/user/new" \
@@ -1120,29 +1122,96 @@ provision_ui_admin() {
         -d "{\"user_email\": \"${email}\", \"user_role\": \"proxy_admin\"}" \
         2>/dev/null || echo "000")
     if [ "${http_code}" != "200" ] && [ "${http_code}" != "201" ]; then
-        log_warn "Could not create admin user via /user/new (HTTP ${http_code}) (user may already exist); trying the invitation anyway."
+        log_warn "Could not create admin user via /user/new (HTTP ${http_code}) (user may already exist); continuing."
+    fi
+    user_id="$(yq eval '.user_id // ""' "${user_resp}" 2>/dev/null || true)"
+    rm -f "${user_resp}"
+    if [ -z "${user_id}" ] || [ "${user_id}" = "null" ]; then
+        # User from an earlier deploy: fetch id via /user/get_users?  Fall back
+        # to the stored invitation's user_id.
+        user_id="$(yq eval '.user_id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
     fi
 
-    # 2. Mint the invitation link the admin uses to set their own password.
+    # 2. Mint (or reuse) the invitation.
+    local invite_id
+    if [ -f "${SECRETS_DIR}/admin_invite.json" ]; then
+        invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
+    fi
     local resp
     resp=$(mktemp)
-    http_code=$(curl -s -o "${resp}" -w "%{http_code}" -m 30 \
-        -X POST "http://${NODE_IP}:${LITELLM_PORT}/invitation/new" \
-        -H "Authorization: Bearer ${master_key}" \
-        -H "Content-Type: application/json" \
-        -d "{\"user_email\": \"${email}\"}" \
-        2>/dev/null || echo "000")
-    if [ "${http_code}" = "200" ] || [ "${http_code}" = "201" ]; then
-        (umask 077 && cp "${resp}" "${SECRETS_DIR}/admin_invite.json")
-        chown_svc "${SECRETS_DIR}/admin_invite.json"
-        log "Admin UI invitation created for ${email}."
-    else
-        # Invitation may already exist from a previous deploy; keep going —
-        # the banner prints the stored invite and the --secure-ui path.
-        log_warn "Could not create admin invitation via /invitation/new (HTTP ${http_code}) (may already exist)."
+    if [ -z "${invite_id}" ] || [ "${invite_id}" = "null" ]; then
+        http_code=$(curl -s -o "${resp}" -w "%{http_code}" -m 30 \
+            -X POST "http://${NODE_IP}:${LITELLM_PORT}/invitation/new" \
+            -H "Authorization: Bearer ${master_key}" \
+            -H "Content-Type: application/json" \
+            -d "{\"user_id\": \"${user_id}\"}" \
+            2>/dev/null || echo "000")
+        if [ "${http_code}" = "200" ] || [ "${http_code}" = "201" ]; then
+            (umask 077 && cp "${resp}" "${SECRETS_DIR}/admin_invite.json")
+            chown_svc "${SECRETS_DIR}/admin_invite.json"
+            invite_id="$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)"
+        else
+            log_warn "Could not create admin invitation via /invitation/new (HTTP ${http_code}); claiming not attempted."
+            rm -f "${resp}"
+            return 0
+        fi
     fi
-    rm -f "${resp}"
-    return 0
+
+    # 3. Claim the invitation exactly as /ui/onboarding does: exchange the
+    #    invitation id for a short-lived onboarding JWT, then set the password.
+    local onboarding_jwt wrapped_jwt payload
+    # get_token returns "token": a JWT wrapping ReturnedUITokenObject whose
+    # "key" field is the raw onboarding JWT (token_type=litellm_onboarding).
+    # claim_token's Authorization header wants that inner JWT, so decode it out.
+    wrapped_jwt=$(curl -s -m 30 "http://${NODE_IP}:${LITELLM_PORT}/onboarding/get_token?invite_link=${invite_id}" \
+        2>/dev/null | yq eval '.token // ""' - 2>/dev/null || true)
+    payload=$(printf '%s' "${wrapped_jwt}" | cut -d. -f2 | tr '_-' '/+')
+    case $(( ${#payload} % 4 )) in
+        2) payload="${payload}==" ;;
+        3) payload="${payload}=" ;;
+    esac
+    onboarding_jwt=$(printf '%s' "${payload}" | base64 -d 2>/dev/null | yq eval '.key // ""' - 2>/dev/null || true)
+    if [ -z "${onboarding_jwt}" ]; then
+        log_warn "Could not extract the onboarding token from /onboarding/get_token; falling back to the manual invite link."
+        (umask 077 && mkdir -p "${SECRETS_DIR}" && printf '%s' "${wrapped_jwt}" > "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)
+        chown_svc "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true
+        return 0
+    fi
+    http_code=$(curl -s -o "${resp}" -w "%{http_code}" -m 30 \
+        -X POST "http://${NODE_IP}:${LITELLM_PORT}/onboarding/claim_token" \
+        -H "Authorization: Bearer ${onboarding_jwt}" \
+        -H "Content-Type: application/json" \
+        -d "{\"invitation_link\": \"${invite_id}\", \"user_id\": \"${user_id}\", \"password\": \"${password}\"}" \
+        2>/dev/null || echo "000")
+    if [ "${http_code}" != "200" ] && [ "${http_code}" != "201" ] && [ "${http_code}" != "303" ]; then
+        log_warn "Could not claim invitation via /onboarding/claim_token (HTTP ${http_code}); falling back to the manual invite link."
+        (umask 077 && cp "${resp}" "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)
+        chown_svc "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true
+        rm -f "${resp}"
+        return 0
+    fi
+
+    # 4. Verify the claimed login end-to-end (form-encoded /login → 303).
+    local verify_code
+    verify_code=$(curl -s -o /dev/null -w "%{http_code}" -m 30 \
+        -X POST "http://${NODE_IP}:${LITELLM_PORT}/login" \
+        --data-urlencode "username=${email}" \
+        --data-urlencode "password=${password}" 2>/dev/null || echo "000")
+    if [ "${verify_code}" != "303" ] && [ "${verify_code}" != "200" ]; then
+        log_warn "Admin login verification failed (HTTP ${verify_code}); bootstrap env-credential login stays ENABLED so you are not locked out."
+        rm -f "${resp}"
+        return 0
+    fi
+
+    # 5. Success: disable bootstrap login and restart LiteLLM with the
+    #    updated config.
+    (umask 077 && touch "${marker}")
+    chown_svc "${marker}"
+    log "Admin UI account provisioned and login verified for ${email}; bootstrap env-credential login is now DISABLED."
+    generate_litellm_config
+    deploy_hub
+    wait_healthy "litellm-proxy" "LiteLLM"
+    log "LiteLLM restarted with env-credential login disabled."
 }
 
 # --secure-ui: after the admin has set their password via the invite link,
