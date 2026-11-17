@@ -117,14 +117,36 @@ step() {
 # Wait for a container to report healthy, with visible progress.
 # $1 container name, $2 label. Bounded: after the timeout the script moves
 # on and tells the user how to check (model downloads can outwait any wait).
+# LOUD ABORT: a container whose engine keeps dying (restart loop) never
+# becomes healthy and previously restarted forever under unless-stopped
+# while the deploy declared success. If the container accumulates >=
+# CRASH_LOOP_MAX restarts during this wait, dump recent logs and exit 1.
+CRASH_LOOP_MAX=3
 wait_healthy() {
     local container="$1" label="$2"
     local tries=36 interval=10  # ~6 minutes
-    local i
+    local i restarts baseline
+    baseline=$(docker inspect "${container}" --format '{{.RestartCount}}' 2>/dev/null | head -1)
+    baseline=${baseline:-0}
     for ((i = 1; i <= tries; i++)); do
         if docker inspect "${container}" --format '{{.State.Health.Status}}' 2>/dev/null | grep -q healthy; then
             printf '\r[%d/%d] %s: healthy ✓\n' "${i}" "${tries}" "${label}"
             return 0
+        fi
+        restarts=$(docker inspect "${container}" --format '{{.RestartCount}}' 2>/dev/null | head -1)
+        restarts=${restarts:-0}
+        if [ $((restarts - baseline)) -ge "${CRASH_LOOP_MAX}" ]; then
+            printf '\n'
+            log_error "${label} is crash-looping (${restarts} restarts since this check started)."
+            log_error "Deploy is aborting instead of waiting on a container that never becomes healthy."
+            log_error "Last 60 log lines from ${container}:"
+            echo "--- begin ${container} logs ---"
+            docker logs --tail 60 "${container}" 2>&1 | sed 's/\r$//'
+            echo "--- end ${container} logs ---"
+            log_error "Common causes: model/checkpoint incompatible with the pinned image (recipe), or a bad serve flag."
+            log_error "Fix the recipe, then re-run. The container is stopped to stop the loop consuming GPU memory."
+            docker stop "${container}" > /dev/null 2>&1 || true
+            exit 1
         fi
         printf '\r[%d/%d] waiting for %s (pull/download can take a while; Ctrl-C safe, deployment continues in background)...' "${i}" "${tries}" "${label}"
         sleep "${interval}"

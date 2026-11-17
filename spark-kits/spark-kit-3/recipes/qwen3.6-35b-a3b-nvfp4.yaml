@@ -47,15 +47,16 @@ tool_call_parser: "qwen3_xml"
 reasoning_parser: "qwen3"
 
 # Maximum model length (context window)
-# 262144 = 256K tokens. NOTE: serving was verified at 131072; 262144 is
-# the intended production setting but needs a boot re-check after the
-# checkpoint switch (KV cache profiling happens at deploy time).
+# 262144 = 256K tokens. Verified on GB10 (driver 580.178.04, pinned digest,
+# 0.6 utilization, FP8 KV cache): boot, health, generation OK; 1.19M KV
+# cache tokens -> 17.7x request concurrency.
 max_model_len: 262144
 
 # GPU memory utilization
 # Everything on GB10 shares one 128GB unified memory pool; vLLM over-
 # allocates at its ~1.0 default and 0.8 OOMs under concurrency. 0.6 is the
-# kit default (measured 0.4 = never-OOM conservative on this box).
+# kit default (measured 0.4 = never-OOM conservative on this box; user
+# ceiling is 0.8, prefer 0.6).
 gpu_memory_utilization: 0.6
 
 # Maximum number of concurrent sequences
@@ -75,7 +76,11 @@ enable_auto_tool_choice: true
 trust_remote_code: false
 
 # Additional vLLM serve flags passed to the container command.
-# Whitespace split, single tokens only. --quantization selects the
-# compressed-tensors loader for this checkpoint; --moe-backend picks the
-# FlashInfer CUTLASS FP4 MoE kernel (verified working on GB10/sm_121).
-extra_flags: "--quantization compressed-tensors --moe-backend flashinfer_cutlass"
+# Whitespace split, single tokens only.
+# --quantization: selects the compressed-tensors loader for this checkpoint.
+# --moe-backend: FlashInfer CUTLASS FP4 MoE kernel (verified on GB10/sm_121).
+# --kv-cache-dtype fp8_e4m3: FP8 KV cache, verified on GB10 at 0.6
+#   utilization + 262144 max len: 1.19M KV tokens, 17.7x concurrency,
+#   health 200, correct generation. Halves KV memory so extra concurrent
+#   agent contexts fit under the same 0.6 ceiling.
+extra_flags: "--quantization compressed-tensors --moe-backend flashinfer_cutlass --kv-cache-dtype fp8_e4m3"
