@@ -23,7 +23,9 @@ GENERATED_DIR="${KIT_DIR}/generated"
 SECRETS_DIR="${KIT_DIR}/secrets"
 
 LITELLM_PORT="4000"
-VLLM_PORT="8000"
+# Must match the port the worker was deployed with (deploy.sh honors
+# SPARK_KIT_VLLM_PORT; default 8000).
+VLLM_PORT="${SPARK_KIT_VLLM_PORT:-8000}"
 
 # --- Tracking ---
 PASSED=0
@@ -367,8 +369,11 @@ verify_generated_files() {
         else
             log_check "Per-worker api_key env references present" "FAIL"
         fi
+        # Literal secret = an api_key value that is NOT an os.environ/ ref.
+        # (The recursive-char class below cannot decide by length: env var
+        # names can be shorter than real keys.)
         if grep -qE "api_key: [A-Za-z0-9]" "${GENERATED_DIR}/litellm-config.yaml" \
-            && ! grep -qE "api_key: (os\.environ/)?[A-Za-z0-9_-]{20,}" "${GENERATED_DIR}/litellm-config.yaml"; then
+            && ! grep -qE "api_key: os\.environ/" "${GENERATED_DIR}/litellm-config.yaml"; then
             log_check "No literal secrets embedded in config" "FAIL"
         else
             log_check "No literal secrets embedded in config" "PASS"
