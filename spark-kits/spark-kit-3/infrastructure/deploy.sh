@@ -859,8 +859,10 @@ generate_secrets() {
             echo "DB_PASSWORD=$(cat "${DB_PASSWORD_FILE}")"
             echo "LITELLM_MASTER_KEY=$(cat "${LITELLM_MASTER_KEY_FILE}")"
             # LiteLLM UI login (admin panel); values from ui_username/_password.
-            echo "LITELLM_UI_USERNAME=$(cat "${UI_USERNAME_FILE}")"
-            echo "LITELLM_UI_PASSWORD=$(cat "${UI_PASSWORD_FILE}")"
+            # NOTE: LiteLLM reads the UN-prefixed names (login_utils.py:
+            # os.getenv("UI_USERNAME")), not LITELLM_UI_*.
+            echo "UI_USERNAME=$(cat "${UI_USERNAME_FILE}")"
+            echo "UI_PASSWORD=$(cat "${UI_PASSWORD_FILE}")"
             echo "DATABASE_URL=postgresql://litellm:$(cat "${DB_PASSWORD_FILE}")@postgres:${POSTGRES_PORT}/litellm"
             echo "NODE_IP=${NODE_IP}"
             echo "LITELLM_IMAGE=${LITELLM_IMAGE}"
