@@ -1188,11 +1188,16 @@ provision_ui_admin() {
     }
     if ! get_onboarding_jwt; then
         # Stored invitation is unusable (used/expired) — mint a fresh one once.
-        log "Stored invitation not usable; minting a fresh one."
+        log "Stored invitation not usable; minting a fresh one. (user_id='${user_id:0:12}...' invite_id='${invite_id:0:12}...' get_token_resp='${wrapped_jwt:0:120}')"
+        if [ -z "${user_id}" ] || [ "${user_id}" = "null" ]; then
+            log_warn "user_id unknown; cannot mint a fresh invitation. Falling back to the manual invite link."
+            rm -f "${resp}"
+            return 0
+        fi
         if mint_invitation && get_onboarding_jwt; then
             :
         else
-            log_warn "Could not obtain an onboarding token; falling back to the manual invite link."
+            log_warn "Could not obtain an onboarding token (get_token_resp='${wrapped_jwt:0:120}' mint_code='${http_code}'); falling back to the manual invite link."
             [ -z "${invite_id}" ] || [ "${invite_id}" = "null" ] && invite_id=""
             printf '%s' "{\"id\":\"${invite_id}\",\"user_id\":\"${user_id}\"}" \
                 | (umask 077 && tee "${SECRETS_DIR}/admin_invite.json" >/dev/null)
