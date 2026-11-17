@@ -765,7 +765,11 @@ generate_secrets() {
         local LITELLM_MASTER_KEY_FILE="${SECRETS_DIR}/litellm_master_key.txt"
 
         if [ ! -f "${DB_PASSWORD_FILE}" ]; then
-            (umask 077 && openssl rand -base64 32 > "${DB_PASSWORD_FILE}")
+            # hex, NOT base64: the password is interpolated unencoded into
+            # DATABASE_URL (postgresql://litellm:<pw>@postgres:...). Base64's
+            # '/' breaks prisma's URL parse ("P1013: invalid port number")
+            # and '+' is lost to form-encoding — the #14 restart loop.
+            (umask 077 && openssl rand -hex 32 > "${DB_PASSWORD_FILE}")
             chown_svc "${DB_PASSWORD_FILE}"
             log "Generated DB password."
         fi
