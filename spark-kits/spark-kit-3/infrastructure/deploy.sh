@@ -90,6 +90,7 @@ USE_CURRENT_USER=false
 SYNC_KEYS_ONLY=false
 RESTART_ONLY=false
 STATUS_ONLY=false
+SECURE_UI=false
 
 # --- Functions ---
 
@@ -205,6 +206,10 @@ parse_args() {
                 ;;
             --status)
                 STATUS_ONLY=true
+                shift
+                ;;
+            --secure-ui)
+                SECURE_UI=true
                 shift
                 ;;
             --help|-h)
@@ -1083,10 +1088,10 @@ LITELLM_CONFIG_FOOTER
     chown_svc "${config_file}"
 }
 
-# Provision the DB-backed Admin UI account (proxy admin) via the running
-# proxy's /user/new API, then disable bootstrap env-credential login by
-# writing the marker file and regenerating the config. Idempotent: skipped
-# once the marker exists. On failure bootstrap login stays enabled.
+# Provision an Admin UI invitation for the DB-backed proxy-admin account.
+# This LiteLLM build refuses passwords via /user/new; the user sets their
+# own password through the returned invite link. Idempotent per stored
+# invite; --secure-ui finalizes by disabling bootstrap env login.
 provision_ui_admin() {
     local marker="${SECRETS_DIR}/env_login_disabled"
     if [ -f "${marker}" ]; then
@@ -1094,40 +1099,74 @@ provision_ui_admin() {
         return 0
     fi
 
-    local email password
+    local email
     email="$(cat "${SECRETS_DIR}/admin_email.txt" 2>/dev/null || echo "")"
-    password="$(cat "${SECRETS_DIR}/admin_ui_password.txt" 2>/dev/null || echo "")"
-    if [ -z "${email}" ] || [ -z "${password}" ]; then
-        log_warn "Admin email/password files missing; skipping DB admin provisioning (bootstrap env login stays enabled)."
+    if [ -z "${email}" ]; then
+        log_warn "Admin email file missing; skipping admin invitation (bootstrap env login stays enabled)."
         return 0
     fi
 
-    local master_key
+    local master_key http_code
     master_key="$(cat "${SECRETS_DIR}/litellm_master_key.txt")"
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 30 \
+
+    # 1. Create the user record (no password — this build refuses passwords
+    #    via /user/new; the password is set via the invitation link).
+    local user_resp
+    user_resp=$(mktemp)
+    http_code=$(curl -s -o "${user_resp}" -w "%{http_code}" -m 30 \
         -X POST "http://${NODE_IP}:${LITELLM_PORT}/user/new" \
         -H "Authorization: Bearer ${master_key}" \
         -H "Content-Type: application/json" \
-        -d "{\"user_email\": \"${email}\", \"user_role\": \"proxy_admin\", \"password\": \"${password}\"}" \
+        -d "{\"user_email\": \"${email}\", \"user_role\": \"proxy_admin\"}" \
         2>/dev/null || echo "000")
-    case "${http_code}" in
-        200|201)
-            (umask 077 && touch "${marker}")
-            chown_svc "${marker}"
-            log "Admin UI account provisioned for ${email}; bootstrap env-credential login is now DISABLED."
-            # Regenerate the config with the disable flag and re-apply the
-            # hub stack so the running proxy picks it up immediately.
-            generate_litellm_config
-            deploy_hub
-            wait_healthy "litellm-proxy" "LiteLLM"
-            log "LiteLLM restarted with env-credential login disabled."
-            ;;
-        *)
-            log_warn "Could not provision Admin UI account via /user/new (HTTP ${http_code}); bootstrap env-credential login stays ENABLED."
-            return 0
-            ;;
+    if [ "${http_code}" != "200" ] && [ "${http_code}" != "201" ]; then
+        log_warn "Could not create admin user via /user/new (HTTP ${http_code}) (user may already exist); trying the invitation anyway."
+    fi
+
+    # 2. Mint the invitation link the admin uses to set their own password.
+    local resp
+    resp=$(mktemp)
+    http_code=$(curl -s -o "${resp}" -w "%{http_code}" -m 30 \
+        -X POST "http://${NODE_IP}:${LITELLM_PORT}/invitation/new" \
+        -H "Authorization: Bearer ${master_key}" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_email\": \"${email}\"}" \
+        2>/dev/null || echo "000")
+    if [ "${http_code}" = "200" ] || [ "${http_code}" = "201" ]; then
+        (umask 077 && cp "${resp}" "${SECRETS_DIR}/admin_invite.json")
+        chown_svc "${SECRETS_DIR}/admin_invite.json"
+        log "Admin UI invitation created for ${email}."
+    else
+        # Invitation may already exist from a previous deploy; keep going —
+        # the banner prints the stored invite and the --secure-ui path.
+        log_warn "Could not create admin invitation via /invitation/new (HTTP ${http_code}) (may already exist)."
+    fi
+    rm -f "${resp}"
+    return 0
+}
+
+# --secure-ui: after the admin has set their password via the invite link,
+# disable bootstrap env-credential login (marker + config regen + restart).
+secure_ui() {
+    if [ -f "${SECRETS_DIR}/env_login_disabled" ]; then
+        log "Env-credential login is already disabled."
+        return 0
+    fi
+    if [ ! -f "${SECRETS_DIR}/admin_email.txt" ]; then
+        log_error "No admin account provisioned yet; run a full deploy first."
+        exit 1
+    fi
+    read -r -p "Have you set YOUR OWN password via the invitation link for $(cat "${SECRETS_DIR}/admin_email.txt")? Env login WILL be disabled. Proceed? [y/N]: " response
+    case "${response}" in
+        [yY][eE][sS]|[yY]) ;;
+        *) log "Aborted; env-credential login left enabled."; return 0 ;;
     esac
+    (umask 077 && touch "${SECRETS_DIR}/env_login_disabled")
+    chown_svc "${SECRETS_DIR}/env_login_disabled"
+    generate_litellm_config
+    deploy_hub
+    wait_healthy "litellm-proxy" "LiteLLM"
+    log "Env-credential login disabled. UI login: $(cat "${SECRETS_DIR}/admin_email.txt") + your invitation password."
 }
 
 # Record this node in the inventory so the file stays the single source of truth.
@@ -1780,6 +1819,16 @@ main() {
     if [ "${STATUS_ONLY}" = false ]; then
         validate_mode
     fi
+    if [ "${SECURE_UI}" = true ]; then
+        # Needs yq (config regen) + docker; no other deployment changes.
+        # shellcheck disable=SC1091
+        source "${KIT_DIR}/scripts/ensure-yq.sh"
+        ensure_yq || { log_error "Could not provision mikefarah/yq."; return 1; }
+        # shellcheck disable=SC1091
+        source "${KIT_DIR}/scripts/lib-driver.sh"
+        secure_ui
+        return $?
+    fi
     if [ "${STATUS_ONLY}" = true ]; then
         # Read-only: needs only the yq flavor check; no service changes.
         # Runs without sudo by design — status is the node operator's
@@ -1900,12 +1949,20 @@ main() {
         log "LiteLLM endpoint: http://${NODE_IP}:${LITELLM_PORT}/v1"
         log "LiteLLM UI (admin panel): http://${NODE_IP}:${LITELLM_PORT}/ui"
         if [ -f "${SECRETS_DIR}/env_login_disabled" ]; then
-            log "LiteLLM UI login: $(cat "${SECRETS_DIR}/admin_email.txt") / password in ${KIT_DIR}/secrets/admin_ui_password.txt"
-            log_warn "Copy these credentials somewhere safe now — they will NOT be shown again in this banner (recoverable later only from ${KIT_DIR}/secrets/admin_ui_password.txt with sudo)."
-            log "Bootstrap env-credential login is DISABLED (a DB admin account exists)."
+            log "LiteLLM UI login: $(cat "${SECRETS_DIR}/admin_email.txt") with the password you set via the invitation link."
+            log "Bootstrap env-credential login is DISABLED."
         else
-            log "LiteLLM UI bootstrap login: $(cat "${SECRETS_DIR}/ui_username.txt" 2>/dev/null || echo "?") / password in ${KIT_DIR}/secrets/ui_password.txt"
-            log_warn "Bootstrap credentials only — a DB admin account could not be provisioned automatically. Log in, create an admin user (UI → Invite/Account), then re-run the deploy to finish securing the panel."
+            log "Admin UI account email: $(cat "${SECRETS_DIR}/admin_email.txt" 2>/dev/null || echo "?")"
+            if [ -f "${SECRETS_DIR}/admin_invite.json" ]; then
+                local invite_id invite_url
+                invite_id=$(yq eval '.id // ""' "${SECRETS_DIR}/admin_invite.json" 2>/dev/null || true)
+                invite_url="http://${NODE_IP}:${LITELLM_PORT}/ui/onboarding?invitation_id=${invite_id}"
+                log "Set YOUR password now — invitation link (copy it somewhere safe; NOT shown again; expires in 7 days):"
+                log "  ${invite_url:-see ${KIT_DIR}/secrets/admin_invite.json}"
+            else
+                log_warn "No admin invitation on file. Log in with the bootstrap credentials and create an admin user in the UI."
+            fi
+            log_warn "Bootstrap UI credentials are still ACTIVE (admin / ${SECRETS_DIR}/ui_password.txt) — this is the critical warning LiteLLM shows. Set your password via the link above, then run: sudo $0 --secure-ui"
         fi
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - ensure port ${LITELLM_PORT} is secured manually"
