@@ -1190,14 +1190,21 @@ deploy_worker() {
 
     # vLLM needs shared memory for activation/compile buffers; size comes from
     # the recipe (shm_size). This is an ipc/disc setting, not host networking.
-    # HF model cache: exactly one mount + one HF_HUB_CACHE declaration, decided
-    # here. NFS takes precedence when mounted on the host (shared multi-node
-    # cache, mounted into the container at the same host path); otherwise a
-    # per-node host dir under GENERATED_DIR persists the ~18 GB download
-    # across container recreation/redeploys. The container runs as the
-    # service user, so the local dir must be owned by it. HOME is redirected
-    # to a writable path: with --user the image's default HOME (/ or /root)
-    # is unwritable and tooling (HF download, torch) dies on first write.
+    # HF MODEL CACHE — DO NOT DELETE: weights are downloaded once (~23 GB
+    # for the default recipe) and every redeploy/probe/test reuses them.
+    # The cache lives in exactly one place and is never removed by the
+    # script; wiping it forces a full re-download and wears the SSD.
+    #   - NFS mounted at /mnt/shared-models: shared multi-node cache,
+    #     mounted into the container at the same host path. Takes precedence.
+    #   - otherwise: per-node host dir ${GENERATED_DIR}/hf-cache, bind-mounted
+    #     read-write at /hf-cache (HF_HUB_CACHE). Persists across container
+    #     recreation, redeploys, and --restart-services because it lives
+    #     outside docker's lifespan. The container runs as the service user,
+    #     so the local dir must be owned by it. HOME is redirected to a
+    #     writable path: with --user the image's default HOME (/ or /root)
+    #     is unwritable and tooling (HF download, torch) dies on first write.
+    # To reclaim disk intentionally, remove the specific model dir under
+    # hf-cache/<org>/<model> — never the whole directory tree blindly.
     local cache_flags=()
     if [ -d "/mnt/shared-models" ] && mountpoint -q "/mnt/shared-models" 2>/dev/null; then
         log "Using NFS model cache at /mnt/shared-models"
@@ -1207,6 +1214,14 @@ deploy_worker() {
         mkdir -p "${hf_cache_dir}"
         chown_svc "${hf_cache_dir}"
         cache_flags=(--env "HF_HUB_CACHE=/hf-cache" -v "${hf_cache_dir}:/hf-cache")
+        # Surface cache hits so operators can tell "download" from "load".
+        if [ -n "$(ls -A "${hf_cache_dir}" 2>/dev/null)" ]; then
+            local cache_kb
+            cache_kb=$(du -sk "${hf_cache_dir}" 2>/dev/null | cut -f1)
+            log "HF model cache already populated at ${hf_cache_dir} ($((cache_kb / 1024 / 1024)) GB) — no re-download."
+        else
+            log "HF model cache empty; the worker will download the checkpoint into ${hf_cache_dir} (one-time, ~23 GB for the default recipe)."
+        fi
     fi
 
     # Command form depends on the image's entrypoint, which differs between

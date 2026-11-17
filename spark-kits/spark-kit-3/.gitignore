@@ -64,3 +64,6 @@ dist/
 # Shell history (if any)
 .bash_history
 .history
+
+# local-only spec, never committed (issue #20)
+SPEC.md
