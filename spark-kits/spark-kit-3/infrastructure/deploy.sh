@@ -932,13 +932,14 @@ LITELLM_CONFIG_HEADER
 
     # This node's own worker (hub+worker role)
     if is_worker; then
-        local hf served
-        hf=$(recipe_field "${MODEL_RECIPE}" "model_name" "nvidia/Qwen3.6-35B-A3B-NVFP4")
+        local served
         served=$(recipe_field "${MODEL_RECIPE}" "served_model_name" "${MODEL_RECIPE}")
         cat >> "${config_file}" << LITELLM_CONFIG_ENTRY
   - model_name: ${served}
     litellm_params:
-      model: openai/${hf}
+      # The worker serves --served-model-name (= ${served}), not the HF path;
+      # 'openai/' is LiteLLM's OpenAI-compatible-provider prefix.
+      model: openai/${served}
       # Same-node worker: route via the node's LAN IP, not any
       # gateway alias — nothing is published on the default bridge gateway,
       # the worker binds NODE_IP only. Reachability from this bridge is
@@ -956,7 +957,7 @@ LITELLM_CONFIG_ENTRY
     local entry
     while IFS= read -r entry; do
         [ -z "${entry}" ] && continue
-        local wid wip wrecipe hf served
+        local wid wip wrecipe served
         wid="$(echo "${entry}" | cut -d'|' -f1)"
         wip="$(echo "${entry}" | cut -d'|' -f2)"
         wrecipe="$(echo "${entry}" | cut -d'|' -f3)"
@@ -969,7 +970,6 @@ LITELLM_CONFIG_ENTRY
         fi
 
         [ -f "${KIT_DIR}/recipes/${wrecipe}.yaml" ] || wrecipe="qwen3.6-35b-a3b-nvfp4"
-        hf=$(recipe_field "${wrecipe}" "model_name" "nvidia/Qwen3.6-35B-A3B-NVFP4")
         served=$(recipe_field "${wrecipe}" "served_model_name" "${wrecipe}")
 
         local key_var
@@ -982,7 +982,8 @@ LITELLM_CONFIG_ENTRY
         cat >> "${config_file}" << LITELLM_CONFIG_ENTRY
   - model_name: ${served}
     litellm_params:
-      model: openai/${hf}
+      # The worker serves --served-model-name (= ${served}).
+      model: openai/${served}
       api_base: http://${wip}:${VLLM_PORT}/v1
       api_key: ${key_var}
 LITELLM_CONFIG_ENTRY

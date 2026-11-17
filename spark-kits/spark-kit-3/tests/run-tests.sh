@@ -125,7 +125,7 @@ check "per-worker api_key env var for spark-02" $(grep -q "os.environ/VLLM_KEY_S
 check "per-worker api_key env var for spark-03" $(grep -q "os.environ/VLLM_KEY_SPARK_03" "${CFG}"; echo $?)
 check "per-worker api_base for spark-02" $(grep -q "api_base: http://10.0.0.31:8000/v1" "${CFG}"; echo $?)
 check "per-worker api_base for spark-03" $(grep -q "api_base: http://10.0.0.32:8000/v1" "${CFG}"; echo $?)
-check "model from worker's own recipe (openai/acme/Other-Model-7B)" $(grep -q "model: openai/acme/Other-Model-7B" "${CFG}"; echo $?)
+check "model from worker's own recipe (openai/<served_model_name>)" $(grep -q "model: openai/other-model" "${CFG}"; echo $?)
 check "no literal secret values in config" $(grep -q "testvalue" "${CFG}"; test $? -eq 1; echo $?)
 check "no shared/single api_key variable across routes" $(grep -q "api_key: os.environ/VLLM_API_KEY" "${CFG}"; test $? -eq 1; echo $?)
 
