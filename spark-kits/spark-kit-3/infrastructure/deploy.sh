@@ -1106,7 +1106,7 @@ provision_ui_admin() {
     master_key="$(cat "${SECRETS_DIR}/litellm_master_key.txt")"
     local http_code
     http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 30 \
-        -X POST "http://localhost:${LITELLM_PORT}/user/new" \
+        -X POST "http://${NODE_IP}:${LITELLM_PORT}/user/new" \
         -H "Authorization: Bearer ${master_key}" \
         -H "Content-Type: application/json" \
         -d "{\"user_email\": \"${email}\", \"user_role\": \"proxy_admin\", \"password\": \"${password}\"}" \
