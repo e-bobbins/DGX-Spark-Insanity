@@ -43,6 +43,9 @@ services:
       - ${SECRETS_DIR}/hub.env
     volumes:
       - ${GENERATED_DIR}/litellm-config.yaml:/app/config.yaml:ro
+    # main-stable image does not auto-load /app/config.yaml; pass it
+    # explicitly or the proxy starts with an empty model list.
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
     ports:
       - "${NODE_IP}:${LITELLM_PORT:-4000}:4000"
     networks:
