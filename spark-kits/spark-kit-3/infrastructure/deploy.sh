@@ -68,7 +68,11 @@ VLLM_IMAGE="${VLLM_IMAGE_DEFAULT}"
 # Minimum host driver any NGC image pinned in this kit is known to work on:
 # the R580 branch floor. Recipes may raise it via `min_driver`.
 MIN_DRIVER_VERSION="580.65"
-LITELLM_IMAGE="ghcr.io/berriai/litellm:v1.83.7-stable"
+# LiteLLM: v1.83.7-stable is wolfi-based and its prisma query engine cannot
+# start (NotConnectedError crash loop, #14 cause 2). The main-stable branch
+# image verified healthy on the node (health/liveliness 200, zero prisma
+# errors) is pinned by digest; re-validate on every re-pin.
+LITELLM_IMAGE="ghcr.io/berriai/litellm:main-stable@sha256:11175975a3093e05e92faee2fe2fe3412a3ae2fcaa849eb0fe25d5f0d8bcb2e9"
 POSTGRES_IMAGE="pgvector/pgvector:pg17"
 
 # Global variables for user input
@@ -419,6 +423,34 @@ EOF
     log "Client subnets: ${CLIENT_SUBNETS[*]}"
 }
 
+# Prompt for the docker bridge subnet. This subnet is the single source of
+# truth for (a) `docker network create` and (b) the firewall rules that let
+# same-node containers reach the worker's published vLLM port, so it is
+# user-specifiable — any RFC1918 CIDR works, nothing is pinned to
+# 10.0.0.0/24-style networks. SPARK_KIT_DOCKER_SUBNET overrides the prompt
+# for unattended deploys. The previous value in the inventory is the default.
+prompt_docker_subnet() {
+    local configured
+    configured=$(yq eval '.lab.docker_subnet // ""' "${INVENTORY_FILE}" 2>/dev/null || echo "")
+    local default_subnet="${configured:-${DOCKER_NETWORK_SUBNET}}"
+
+    if [ -n "${SPARK_KIT_DOCKER_SUBNET:-}" ]; then
+        DOCKER_NETWORK_SUBNET="${SPARK_KIT_DOCKER_SUBNET}"
+    else
+        read -r -p "Enter docker network subnet [default: ${default_subnet}]: " input_subnet
+        DOCKER_NETWORK_SUBNET="${input_subnet:-${default_subnet}}"
+    fi
+
+    if [[ ! "${DOCKER_NETWORK_SUBNET}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        log_error "Invalid CIDR notation: ${DOCKER_NETWORK_SUBNET}. Expected format: X.X.X.X/XX"
+        prompt_docker_subnet
+        return
+    fi
+
+    export DOCKER_NETWORK_SUBNET
+    log "Docker network subnet: ${DOCKER_NETWORK_SUBNET}"
+}
+
 # Prompt for hub IP if this is a worker
 prompt_hub_ip() {
     if is_hub; then
@@ -575,6 +607,7 @@ collect_user_input() {
     fi
 
     prompt_node_ip
+    prompt_docker_subnet
     try_detect_node
     if [ "${CONFIG_PREFILLED}" = true ]; then
         # Restore hub-side extras from the same recorded config.
@@ -610,6 +643,7 @@ collect_user_input() {
     echo "  Node ID:       ${NODE_ID}"
     echo "  Node IP:       ${NODE_IP}"
     echo "  Role:          ${NODE_ROLE}"
+    echo "  Docker Subnet: ${DOCKER_NETWORK_SUBNET}"
     if is_hub && [ "${#CLIENT_SUBNETS[@]}" -gt 0 ]; then
         echo "  Client Subnets: ${CLIENT_SUBNETS[*]}"
     fi
@@ -698,6 +732,12 @@ setup_firewall() {
         fi
         ufw allow from "${HUB_LAN_IP}" to any port "${VLLM_PORT}" proto tcp comment 'Worker Hub Access'
         log "Allowed vLLM port ${VLLM_PORT} from hub at ${HUB_LAN_IP}"
+        # Same-node containers (LiteLLM hub on the same host reaching its own
+        # worker) arrive at the docker-proxy socket with a source from the
+        # docker bridge subnet; without this rule ufw INPUT drops them and the
+        # hub cannot route to its local worker (#14 cause 3).
+        ufw allow from "${DOCKER_NETWORK_SUBNET}" to any port "${VLLM_PORT}" proto tcp comment 'Worker Container Access (same-node)'
+        log "Allowed vLLM port ${VLLM_PORT} from docker subnet ${DOCKER_NETWORK_SUBNET}"
     fi
 
     ufw default allow outgoing
@@ -899,7 +939,11 @@ LITELLM_CONFIG_HEADER
   - model_name: ${served}
     litellm_params:
       model: openai/${hf}
-      api_base: http://host.docker.internal:${VLLM_PORT}/v1
+      # Same-node worker: route via the node's LAN IP, not any
+      # gateway alias — nothing is published on the default bridge gateway,
+      # the worker binds NODE_IP only. Reachability from this bridge is
+      # granted by the firewall rule on the docker subnet.
+      api_base: http://${NODE_IP}:${VLLM_PORT}/v1
       api_key: os.environ/VLLM_KEY_$(sanitize_node_id "${NODE_ID}")
 LITELLM_CONFIG_ENTRY
     fi
@@ -966,6 +1010,10 @@ update_inventory() {
     else
         yq eval -i '.nodes += [{"node_id": env(NODE_ID), "role": env(NODE_ROLE), "lan_ip": env(NODE_IP), "model_recipe": null}]' "${INVENTORY_FILE}"
     fi
+    # Remember the docker bridge subnet so later runs default to it.
+    export DOCKER_NETWORK_SUBNET
+    yq eval -i '.lab.docker_subnet = env(DOCKER_NETWORK_SUBNET)' "${INVENTORY_FILE}"
+    export -n DOCKER_NETWORK_SUBNET
     # Drop the export attribute without undefining the globals: later code
     # (is_hub / is_worker / summary) still reads them under set -u.
     export -n NODE_ID NODE_ROLE NODE_IP MODEL_RECIPE
@@ -1520,6 +1568,43 @@ ensure_container_forward_allowances() {
             fi
         done
         log "Container forwarding rules active in DOCKER-USER for ${subnet}"
+
+        # 1b. Published-port guard. Docker's DNAT for published ports
+        # bypasses ufw's INPUT chain, so source restrictions for LAN clients
+        # must live in DOCKER-USER (evaluated before Docker's own accept
+        # rules). Keep the DOCKER subnet, client subnets and the hub IP
+        # allowed; drop everything else aimed at the kit's published ports.
+        local -a guard_rules=()
+        local gport gsub
+        for gport in "${LITELLM_PORT}" "${VLLM_PORT}"; do
+            if is_hub && [ "${gport}" = "${LITELLM_PORT}" ]; then
+                guard_rules+=("-p tcp --dport ${gport} -j DROP")
+                for gsub in "${CLIENT_SUBNETS[@]}"; do
+                    guard_rules+=("-s ${gsub} -p tcp --dport ${gport} -j ACCEPT")
+                done
+                guard_rules+=("-s ${DOCKER_NETWORK_SUBNET} -p tcp --dport ${gport} -j ACCEPT")
+            fi
+            if is_worker && [ "${gport}" = "${VLLM_PORT}" ]; then
+                guard_rules+=("-p tcp --dport ${gport} -j DROP")
+                [ -n "${HUB_LAN_IP}" ] && guard_rules+=("-s ${HUB_LAN_IP} -p tcp --dport ${gport} -j ACCEPT")
+                guard_rules+=("-s ${DOCKER_NETWORK_SUBNET} -p tcp --dport ${gport} -j ACCEPT")
+            fi
+        done
+        # Insert in reverse at position 1 so the final order is
+        # accepts-then-drops, all ahead of the generic rules above.
+        local -i i
+        for ((i = ${#guard_rules[@]} - 1; i >= 0; i--)); do
+            # shellcheck disable=SC2086
+            if ! iptables -C DOCKER-USER ${guard_rules[i]} 2>/dev/null; then
+                if ! iptables -I DOCKER-USER 1 ${guard_rules[i]}; then
+                    log_warn "Could not add published-port guard '${guard_rules[i]}'."
+                fi
+            fi
+        done
+        if [ "${#guard_rules[@]}" -gt 0 ]; then
+            log "Published-port guard active in DOCKER-USER (vLLM ${VLLM_PORT}, LiteLLM ${LITELLM_PORT})."
+            log_warn "DOCKER-USER rules are runtime-only; re-run the deploy after a reboot (or dockerd restart) to restore them."
+        fi
     else
         log_warn "DOCKER-USER chain missing (${ipt_err})."
         log_warn "Docker's iptables integration appears disabled; provisioning NAT + forwarding manually."

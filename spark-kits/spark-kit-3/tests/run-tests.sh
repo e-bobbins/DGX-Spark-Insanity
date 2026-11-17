@@ -129,6 +129,29 @@ check "model from worker's own recipe (openai/acme/Other-Model-7B)" $(grep -q "m
 check "no literal secret values in config" $(grep -q "testvalue" "${CFG}"; test $? -eq 1; echo $?)
 check "no shared/single api_key variable across routes" $(grep -q "api_key: os.environ/VLLM_API_KEY" "${CFG}"; test $? -eq 1; echo $?)
 
+# Same-node worker route (#14 cause 3): a hub+worker must route its own
+# worker via the node LAN IP — host.docker.internal resolves to the default
+# bridge gateway where nothing is published.
+(
+  export PATH="${WORK}/bin:${PATH}"
+  # shellcheck disable=SC1091
+  source "${KIT_DIR}/infrastructure/deploy.sh"
+  KIT_DIR="${WORK}"
+  INVENTORY_FILE="${WORK}/inventory.yaml"
+  GENERATED_DIR="${WORK}/generated"
+  SECRETS_DIR="${WORK}/secrets"
+  NODE_ROLE="hub+worker"
+  USE_CURRENT_USER=true
+  MODEL_RECIPE="qwen3.6-35b-a3b-nvfp4"
+  NODE_ID="Sandbox"
+  NODE_IP="10.0.0.30"
+  VLLM_PORT="8001"
+  generate_litellm_config || exit 1
+) || echo "hub+worker config generation returned non-zero"
+
+check "same-node route uses node LAN IP, not host.docker.internal" $(grep -q "api_base: http://10.0.0.30:8001/v1" "${CFG}"; echo $?)
+check "no host.docker.internal route generated" $(grep -q "host.docker.internal" "${CFG}"; test $? -eq 1; echo $?)
+
 echo ""
 echo "=== Driver baseline comparison (scripts/lib-driver.sh) ==="
 # shellcheck disable=SC1091
