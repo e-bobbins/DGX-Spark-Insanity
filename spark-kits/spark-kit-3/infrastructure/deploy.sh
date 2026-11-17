@@ -1798,7 +1798,9 @@ main() {
     if is_hub; then
         log "LiteLLM endpoint: http://${NODE_IP}:${LITELLM_PORT}/v1"
         log "LiteLLM UI (admin panel): http://${NODE_IP}:${LITELLM_PORT}/ui"
-        log "LiteLLM UI login: $(cat "${SECRETS_DIR}/ui_username.txt" 2>/dev/null || echo "?") / password in ${KIT_DIR}/secrets/ui_password.txt (read: sudo cat ...)"
+        log "LiteLLM UI login:  username: $(cat "${SECRETS_DIR}/ui_username.txt" 2>/dev/null || echo "?")"
+        log "                   password: $(cat "${SECRETS_DIR}/ui_password.txt" 2>/dev/null || echo "?")"
+        log_warn "Copy these credentials somewhere safe now — they will NOT be shown again in this banner (recoverable later only from ${KIT_DIR}/secrets/ui_password.txt with sudo)."
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - ensure port ${LITELLM_PORT} is secured manually"
         fi
