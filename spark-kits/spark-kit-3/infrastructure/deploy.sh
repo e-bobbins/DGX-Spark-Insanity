@@ -451,6 +451,22 @@ prompt_docker_subnet() {
     log "Docker network subnet: ${DOCKER_NETWORK_SUBNET}"
 }
 
+# Prompt for the Admin UI account email (the DB-backed proxy admin, replaces
+# bootstrap env credentials once provisioned). Default: the previously used
+# value, else admin@lab.local.
+prompt_admin_email() {
+    local default_email="admin@lab.local"
+    [ -f "${SECRETS_DIR}/admin_email.txt" ] && default_email="$(cat "${SECRETS_DIR}/admin_email.txt")"
+    read -r -p "Enter the Admin UI account email [default: ${default_email}]: " input_email
+    ADMIN_UI_EMAIL="${input_email:-${default_email}}"
+    if [[ ! "${ADMIN_UI_EMAIL}" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+        log_error "Invalid email: ${ADMIN_UI_EMAIL}"
+        prompt_admin_email
+        return
+    fi
+    log "Admin UI account: ${ADMIN_UI_EMAIL}"
+}
+
 # Prompt for hub IP if this is a worker
 prompt_hub_ip() {
     if is_hub; then
@@ -633,6 +649,9 @@ collect_user_input() {
         prompt_node_id
         if is_worker; then
             prompt_model_recipe
+        fi
+        if is_hub; then
+            prompt_admin_email
         fi
     fi
 
@@ -848,6 +867,22 @@ generate_secrets() {
             log "Generated LiteLLM UI password."
         fi
 
+        # DB-backed Admin UI account (proxy admin). Provisioned once after
+        # services are healthy (provision_ui_admin), then env-credential
+        # login is disabled. Password is generated for the email; changing
+        # the email regenerates it.
+        local ADMIN_EMAIL_FILE="${SECRETS_DIR}/admin_email.txt"
+        local ADMIN_PASSWORD_FILE="${SECRETS_DIR}/admin_ui_password.txt"
+        if [ ! -f "${ADMIN_EMAIL_FILE}" ]; then
+            (umask 077 && echo "${ADMIN_UI_EMAIL:-admin@lab.local}" > "${ADMIN_EMAIL_FILE}")
+            chown_svc "${ADMIN_EMAIL_FILE}"
+        fi
+        if [ ! -f "${ADMIN_PASSWORD_FILE}" ]; then
+            (umask 077 && openssl rand -hex 16 > "${ADMIN_PASSWORD_FILE}")
+            chown_svc "${ADMIN_PASSWORD_FILE}"
+            log "Generated Admin UI password for $(cat "${ADMIN_EMAIL_FILE}")."
+        fi
+
         local vllm_self_key=""
         if is_worker; then
             vllm_self_key="$(cat "${SECRETS_DIR}/vllm_api_key.txt")"
@@ -1021,19 +1056,78 @@ LITELLM_CONFIG_ENTRY
 LITELLM_CONFIG_ENTRY
     done <<< "${workers}"
 
-    cat >> "${config_file}" << 'LITELLM_CONFIG_FOOTER'
+    cat >> "${config_file}" << LITELLM_CONFIG_FOOTER
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  # false: allow UI login via LITELLM_UI_USERNAME / LITELLM_UI_PASSWORD
-  # (deploy-generated, stored under secrets/). true would lock the admin
-  # panel out entirely — no DB user exists to log in with.
+LITELLM_CONFIG_FOOTER
+
+    # Env-credential login (UI_USERNAME/UI_PASSWORD) is bootstrap-only:
+    # enabled until a DB-backed proxy-admin account has been provisioned
+    # (marker: ${SECRETS_DIR}/env_login_disabled), then permanently off.
+    if [ -f "${SECRETS_DIR}/env_login_disabled" ]; then
+        cat >> "${config_file}" << 'LITELLM_CONFIG_FOOTER'
+  disable_env_credential_login: true
+LITELLM_CONFIG_FOOTER
+    else
+        cat >> "${config_file}" << 'LITELLM_CONFIG_FOOTER'
+  # Bootstrap-only: a DB-backed admin account has NOT been provisioned yet.
+  # The deploy provisions one automatically; until then env credentials are
+  # the only way into the admin panel.
   disable_env_credential_login: false
 LITELLM_CONFIG_FOOTER
+    fi
 
     log "Generated LiteLLM config: ${config_file}"
     chmod 640 "${config_file}"
     chown_svc "${config_file}"
+}
+
+# Provision the DB-backed Admin UI account (proxy admin) via the running
+# proxy's /user/new API, then disable bootstrap env-credential login by
+# writing the marker file and regenerating the config. Idempotent: skipped
+# once the marker exists. On failure bootstrap login stays enabled.
+provision_ui_admin() {
+    local marker="${SECRETS_DIR}/env_login_disabled"
+    if [ -f "${marker}" ]; then
+        log "Admin UI account already provisioned; env-credential login disabled."
+        return 0
+    fi
+
+    local email password
+    email="$(cat "${SECRETS_DIR}/admin_email.txt" 2>/dev/null || echo "")"
+    password="$(cat "${SECRETS_DIR}/admin_ui_password.txt" 2>/dev/null || echo "")"
+    if [ -z "${email}" ] || [ -z "${password}" ]; then
+        log_warn "Admin email/password files missing; skipping DB admin provisioning (bootstrap env login stays enabled)."
+        return 0
+    fi
+
+    local master_key
+    master_key="$(cat "${SECRETS_DIR}/litellm_master_key.txt")"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 30 \
+        -X POST "http://localhost:${LITELLM_PORT}/user/new" \
+        -H "Authorization: Bearer ${master_key}" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_email\": \"${email}\", \"user_role\": \"proxy_admin\", \"password\": \"${password}\"}" \
+        2>/dev/null || echo "000")
+    case "${http_code}" in
+        200|201)
+            (umask 077 && touch "${marker}")
+            chown_svc "${marker}"
+            log "Admin UI account provisioned for ${email}; bootstrap env-credential login is now DISABLED."
+            # Regenerate the config with the disable flag and re-apply the
+            # hub stack so the running proxy picks it up immediately.
+            generate_litellm_config
+            deploy_hub
+            wait_healthy "litellm-proxy" "LiteLLM"
+            log "LiteLLM restarted with env-credential login disabled."
+            ;;
+        *)
+            log_warn "Could not provision Admin UI account via /user/new (HTTP ${http_code}); bootstrap env-credential login stays ENABLED."
+            return 0
+            ;;
+    esac
 }
 
 # Record this node in the inventory so the file stays the single source of truth.
@@ -1752,7 +1846,7 @@ main() {
     collect_user_input
 
     # Step total depends on the role chosen: hub takes 10 steps, worker 8.
-    if is_hub; then STEP_TOTAL=10; else STEP_TOTAL=8; fi
+    if is_hub; then STEP_TOTAL=11; else STEP_TOTAL=8; fi
 
     step "Creating service user"
     create_service_user
@@ -1795,14 +1889,24 @@ main() {
     fi
     setup_nfs
 
+    if is_hub; then
+        step "Provisioning Admin UI account"
+        provision_ui_admin
+    fi
+
     log ""
     log "=== Deployment Complete ==="
     if is_hub; then
         log "LiteLLM endpoint: http://${NODE_IP}:${LITELLM_PORT}/v1"
         log "LiteLLM UI (admin panel): http://${NODE_IP}:${LITELLM_PORT}/ui"
-        log "LiteLLM UI login:  username: $(cat "${SECRETS_DIR}/ui_username.txt" 2>/dev/null || echo "?")"
-        log "                   password: $(cat "${SECRETS_DIR}/ui_password.txt" 2>/dev/null || echo "?")"
-        log_warn "Copy these credentials somewhere safe now — they will NOT be shown again in this banner (recoverable later only from ${KIT_DIR}/secrets/ui_password.txt with sudo)."
+        if [ -f "${SECRETS_DIR}/env_login_disabled" ]; then
+            log "LiteLLM UI login: $(cat "${SECRETS_DIR}/admin_email.txt") / password in ${KIT_DIR}/secrets/admin_ui_password.txt"
+            log_warn "Copy these credentials somewhere safe now — they will NOT be shown again in this banner (recoverable later only from ${KIT_DIR}/secrets/admin_ui_password.txt with sudo)."
+            log "Bootstrap env-credential login is DISABLED (a DB admin account exists)."
+        else
+            log "LiteLLM UI bootstrap login: $(cat "${SECRETS_DIR}/ui_username.txt" 2>/dev/null || echo "?") / password in ${KIT_DIR}/secrets/ui_password.txt"
+            log_warn "Bootstrap credentials only — a DB admin account could not be provisioned automatically. Log in, create an admin user (UI → Invite/Account), then re-run the deploy to finish securing the panel."
+        fi
         if [ "${NON_SUDO_MODE}" = true ]; then
             log_warn "Firewall NOT configured - ensure port ${LITELLM_PORT} is secured manually"
         fi
