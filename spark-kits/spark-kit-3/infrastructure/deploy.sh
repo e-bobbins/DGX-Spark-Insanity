@@ -735,7 +735,7 @@ prune_stale_ufw_rules() {
     local idx
     while :; do
         idx=$(ufw status numbered 2>/dev/null \
-            | grep -E "comment '(${comments})'" \
+            | grep -E "# (${comments})( \(v6\))?$" \
             | tail -1 \
             | sed -n 's/^\[ *\([0-9]*\)\].*/\1/p')
         if [ -z "${idx}" ]; then
