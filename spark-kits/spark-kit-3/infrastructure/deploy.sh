@@ -1946,7 +1946,6 @@ ensure_container_forward_allowances() {
     local tmp
     tmp=$(mktemp)
     {
-        echo ""
         echo "${marker_begin}"
         echo "# Container egress + intra-bridge traffic for ${DOCKER_NETWORK} (fixes Errno 101)"
         echo "-A ufw-after-forward -s ${subnet} -d ${subnet} -j ACCEPT"
@@ -1954,13 +1953,25 @@ ensure_container_forward_allowances() {
         echo "-A ufw-after-forward -s ! ${subnet} -d ${subnet} -j ACCEPT"
         echo "${marker_end}"
     } > "${tmp}"
-    if ! cat "${tmp}" >> "${rules_file}"; then
-        rm -f "${tmp}"
-        log_error "Could not write to ${rules_file}."
-        return 1
+    # The block must live INSIDE the *filter section, i.e. before the file's
+    # final COMMIT — appending after COMMIT leaves the rules outside any
+    # table and iptables-restore rejects the whole file ("line N failed").
+    local commits block2
+    commits=$(grep -c '^COMMIT' "${rules_file}" 2>/dev/null || echo 0)
+    if [ "${commits}" -ge 1 ]; then
+        block2=$(mktemp)
+        awk -v ins_at="${commits}" -v block="$(cat "${tmp}")" '
+            BEGIN { n = 0 }
+            /^COMMIT/ { n++; if (n == ins_at) print block }
+            { print }
+        ' "${rules_file}" > "${block2}" && mv "${block2}" "${rules_file}"
+    else
+        cat "${tmp}" >> "${rules_file}"
     fi
     rm -f "${tmp}"
-    ufw reload > /dev/null 2>&1 || true
+    if ! ufw reload > /dev/null 2>&1; then
+        log_warn "ufw reload reported an error; forwarding rules may not be active until the next reload."
+    fi
     log "Persistent container forwarding rules installed for ${subnet}."
 }
 
