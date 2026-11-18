@@ -91,6 +91,7 @@ SYNC_KEYS_ONLY=false
 RESTART_ONLY=false
 STATUS_ONLY=false
 SECURE_UI=false
+MIGRATE_MODE=false
 
 # --- Functions ---
 
@@ -212,6 +213,18 @@ parse_args() {
                 SECURE_UI=true
                 shift
                 ;;
+            --migrate)
+                MIGRATE_MODE=true
+                shift
+                ;;
+            --ip)
+                if [ -z "${2:-}" ]; then
+                    log_error "--ip requires an address argument."
+                    exit 1
+                fi
+                NODE_IP="$2"
+                shift 2
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -240,6 +253,13 @@ Options:
                       the inventory (by its IP) and re-apply its stack with
                       existing secrets and config. Fails if the node was
                       never deployed here.
+  --secure-ui         Interactive: rotate the Admin UI account and disable the
+                      shared bootstrap env-credential login.
+  --migrate           Re-deploy this node on a NEW network without re-answering
+                      the full prompt flow. Resolves the node by its local
+                      marker (.node-id) instead of its IP; only the node IP
+                      (and the rules derived from it) change. Combine with
+                      --ip <addr> to override the detected address.
   --status            Report this node's install state (containers, health,
                       GPU, model cache, endpoints) with a plain verdict.
                       Never changes anything; safe to run unattended.
@@ -531,6 +551,7 @@ try_detect_node() {
         [ -n "${detected_hub}" ] && [ "${detected_hub}" != "null" ] && HUB_LAN_IP="${detected_hub}"
     fi
     CONFIG_PREFILLED=true
+    printf '%s' "${node_id}" > "${KIT_DIR}/.node-id"
     log "Reusing recorded configuration (change any answer by re-running and answering 'n')."
 }
 
@@ -614,6 +635,51 @@ sync_state_from_inventory() {
     fi
 }
 
+# Restore hub client subnets from the inventory (shared by reuse and migrate).
+restore_client_subnets() {
+    local subnets
+    subnets=$(yq eval '.lab.client_subnets // [] | join(" ")' "${INVENTORY_FILE}" 2>/dev/null || true)
+    if [ -n "${subnets}" ]; then
+        # shellcheck disable=SC2206
+        CLIENT_SUBNETS=(${subnets})
+        log "Restored client subnets from inventory: ${CLIENT_SUBNETS[*]}"
+    fi
+}
+
+# --migrate: resolve this machine's node entry via the local marker file
+# (written on every successful deploy) instead of by IP, so a network move
+# prefills the whole configuration with no prompting.
+resolve_migrate_node() {
+    local marker="${KIT_DIR}/.node-id"
+    if [ ! -f "${marker}" ]; then
+        log_error "--migrate: no previous deployment marker (${marker}). Run the normal deploy flow once first."
+        exit 1
+    fi
+    local node_id entry_role entry_recipe dsn hub
+    node_id="$(cat "${marker}")"
+    entry_role=$(yq eval ".nodes[] | select(.node_id == \"${node_id}\") | .role" "${INVENTORY_FILE}" 2>/dev/null | head -1 || true)
+    if [ -z "${entry_role}" ] || [ "${entry_role}" = "null" ]; then
+        log_error "--migrate: node '${node_id}' not found in inventory. Run the normal deploy flow once to re-register."
+        exit 1
+    fi
+    NODE_ID="${node_id}"
+    NODE_ROLE="${entry_role}"
+    entry_recipe=$(yq eval ".nodes[] | select(.node_id == \"${node_id}\") | .model_recipe" "${INVENTORY_FILE}" 2>/dev/null | head -1 || true)
+    [ "${entry_recipe}" = "null" ] && entry_recipe=""
+    MODEL_RECIPE="${entry_recipe}"
+    dsn=$(yq eval '.lab.docker_subnet // ""' "${INVENTORY_FILE}" 2>/dev/null || true)
+    [ -n "${dsn}" ] && DOCKER_NETWORK_SUBNET="${dsn}"
+    if is_hub; then
+        HUB_LAN_IP="${NODE_IP}"
+        restore_client_subnets
+    else
+        hub=$(yq eval '.nodes[] | select(.role == "hub" or .role == "hub+worker") | .lan_ip' "${INVENTORY_FILE}" 2>/dev/null | head -1 || true)
+        [ -n "${hub}" ] && [ "${hub}" != "null" ] && HUB_LAN_IP="${hub}"
+    fi
+    CONFIG_PREFILLED=true
+    log "Migrating node ${NODE_ID} to ${NODE_IP} (role: ${NODE_ROLE}${MODEL_RECIPE:+, recipe: ${MODEL_RECIPE}})."
+}
+
 # Collect all user input
 collect_user_input() {
     echo ""
@@ -627,36 +693,44 @@ collect_user_input() {
         echo ""
     fi
 
-    prompt_node_ip
-    prompt_docker_subnet
-    try_detect_node
-    if [ "${CONFIG_PREFILLED}" = true ]; then
-        # Restore hub-side extras from the same recorded config.
-        if is_hub; then
-            local subnets
-            subnets=$(yq eval '.lab.client_subnets // [] | join(" ")' "${INVENTORY_FILE}" 2>/dev/null || true)
-            if [ -n "${subnets}" ]; then
-                # shellcheck disable=SC2206
-                CLIENT_SUBNETS=(${subnets})
-                log "Restored client subnets from inventory: ${CLIENT_SUBNETS[*]}"
-            fi
+    if [ "${MIGRATE_MODE}" = true ]; then
+        # Network move: skip prompts entirely. IP = --ip override or the
+        # auto-detected global address; everything else comes from the
+        # machine's marker + the inventory.
+        if [ -z "${NODE_IP}" ]; then
+            NODE_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
         fi
-        echo ""
+        if [ -z "${NODE_IP}" ]; then
+            log_error "Could not detect a global IPv4 address; pass one with --ip <addr>."
+            exit 1
+        fi
+        resolve_migrate_node
     else
-        prompt_role
-        sync_state_from_inventory
-        if is_worker; then
-            prompt_hub_ip
-        fi
-        if is_hub; then
-            prompt_client_subnets
-        fi
-        prompt_node_id
-        if is_worker; then
-            prompt_model_recipe
-        fi
-        if is_hub; then
-            prompt_admin_email
+        prompt_node_ip
+        prompt_docker_subnet
+        try_detect_node
+        if [ "${CONFIG_PREFILLED}" = true ]; then
+            # Restore hub-side extras from the same recorded config.
+            if is_hub; then
+                restore_client_subnets
+            fi
+            echo ""
+        else
+            prompt_role
+            sync_state_from_inventory
+            if is_worker; then
+                prompt_hub_ip
+            fi
+            if is_hub; then
+                prompt_client_subnets
+            fi
+            prompt_node_id
+            if is_worker; then
+                prompt_model_recipe
+            fi
+            if is_hub; then
+                prompt_admin_email
+            fi
         fi
     fi
 
@@ -1337,6 +1411,9 @@ update_inventory() {
     # Drop the export attribute without undefining the globals: later code
     # (is_hub / is_worker / summary) still reads them under set -u.
     export -n NODE_ID NODE_ROLE NODE_IP MODEL_RECIPE
+    # Machine-local marker for --migrate: survives IP changes, identifies the
+    # node without trusting its current address.
+    printf '%s' "${NODE_ID}" > "${KIT_DIR}/.node-id"
 }
 
 # Optional NFS model cache (spec: optional, root_squash, subnet-restricted).
