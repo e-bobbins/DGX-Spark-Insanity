@@ -726,6 +726,25 @@ create_service_user() {
     export SVC_UID SVC_GID
 }
 
+# Remove ufw rules this kit previously wrote (identified by their comments),
+# so a redeploy on a new network (new node IP / client subnets) does not
+# accumulate stale allow rules for addresses that no longer exist. Only our
+# own marked rules are touched; ssh and third-party rules are left alone.
+prune_stale_ufw_rules() {
+    local comments="LiteLLM Hub Access|Worker Hub Access|Worker Container Access|NFS model cache"
+    local idx
+    while :; do
+        idx=$(ufw status numbered 2>/dev/null \
+            | grep -E "comment '(${comments})'" \
+            | tail -1 \
+            | sed -n 's/^\[ *\([0-9]*\)\].*/\1/p')
+        if [ -z "${idx}" ]; then
+            break
+        fi
+        ufw --force delete "${idx}" >/dev/null 2>&1 || true
+    done
+}
+
 setup_firewall() {
     if [ "${NON_SUDO_MODE}" = true ]; then
         log_warn "Skipping firewall configuration in non-sudo mode"
@@ -735,6 +754,7 @@ setup_firewall() {
 
     log "Configuring firewall..."
 
+    prune_stale_ufw_rules
     ensure_container_forward_allowances
 
     ufw default deny incoming
